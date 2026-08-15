@@ -166,6 +166,7 @@ fn tool_file_path(call: &ToolCall) -> Option<&str> {
         | ToolCall::WebSearch { .. }
         | ToolCall::Todo { .. }
         | ToolCall::Mcp { .. }
+        | ToolCall::Task { .. }
         | ToolCall::Unknown { .. } => None,
     }
 }
@@ -271,6 +272,15 @@ struct ReadAttachmentChunkParams {
 struct FetchToolBlobParams {
     /// Doc-resident sidecar ref (`{chatId}/{partId}` or `…​.diff`).
     blob_ref: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SubagentTranscriptParams {
+    chat_id: String,
+    /// The Task tool part's id — the harness-native tool_use id, which keys
+    /// the sidecar's meta.json on the host device's disk.
+    tool_call_id: String,
 }
 
 /// The Mutate surface (feature-inventory §2 DataRpc), tagged by `op`.
@@ -810,6 +820,9 @@ fn forwardable(method: &str) -> bool {
             | methods::UPLOAD_CHUNK
             | methods::UPLOAD_COMMIT
             | methods::READ_ATTACHMENT_CHUNK
+            // Subagent transcripts live in the harness's session store on the
+            // chat's host device.
+            | methods::SUBAGENT_TRANSCRIPT
             // Updates report/apply on the device whose binary they concern.
             | methods::UPDATE_STATUS
             | methods::APPLY_UPDATE
@@ -1713,6 +1726,40 @@ impl RpcService for EngineRpc {
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "text": text }))
+            }
+            methods::SUBAGENT_TRANSCRIPT => {
+                let p: SubagentTranscriptParams = parse_params(params)?;
+                let chat = self
+                    .workspace
+                    .chat(&p.chat_id)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?
+                    .ok_or_else(|| RpcError::Failed("chat not found".into()))?;
+                if chat.device_id != self.doc_host.device_id() {
+                    return Err(RpcError::Failed("chat belongs to another device".into()));
+                }
+                if self.doc_host.harness_for(&p.chat_id) != HarnessId::ClaudeCode {
+                    return Err(RpcError::Failed(
+                        "subagent transcripts are recorded by Claude Code only".into(),
+                    ));
+                }
+                // The sidecar store is keyed by the cwd the harness session ran
+                // in; the stamped session cwd wins over the chat row's.
+                let cwd = self
+                    .workspace
+                    .chat_harness_session(&p.chat_id)
+                    .and_then(|(_, cwd)| cwd)
+                    .or(chat.cwd)
+                    .ok_or_else(|| RpcError::Failed("chat has no workspace folder".into()))?;
+                let transcript = crate::subagents::claude_subagent_transcript(
+                    &crate::subagents::claude_config_dir(),
+                    &cwd,
+                    &p.tool_call_id,
+                )
+                .map_err(|e| RpcError::Failed(e.to_string()))?
+                .ok_or_else(|| {
+                    RpcError::Failed("no subagent transcript on disk for this tool call".into())
+                })?;
+                RpcReply::value(&transcript)
             }
             other => Err(RpcError::UnknownMethod(other.to_string())),
         }

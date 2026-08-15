@@ -126,6 +126,10 @@ pub mod methods {
     /// Lazy full-tool-output fetch from the R2 sidecar by doc-resident ref
     /// (chat2-sync A3). Edge-direct from any device — never relay-forwarded.
     pub const FETCH_TOOL_BLOB: &str = "FetchToolBlob";
+    /// Read a subagent's transcript (a Task tool call's inner activity) from
+    /// the harness's on-disk sidecar. Relay-forwardable — the files live on
+    /// the chat's host device (claude-code only today).
+    pub const SUBAGENT_TRANSCRIPT: &str = "SubagentTranscript";
     // Updates (ControlRpc, relay-forwardable — a device reports/applies its own
     // binary's update). Stream: current UpdateStatus, then every change.
     pub const UPDATE_STATUS: &str = "UpdateStatus";

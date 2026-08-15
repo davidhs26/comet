@@ -402,8 +402,10 @@ pub fn sidecar_payload(event: &AgentEvent) -> Option<SidecarPayload> {
 
 /// Render-only privacy policy — strip heavy/sensitive tool inputs before a call enters the doc.
 ///
-/// Keeps: command / path / pattern / url / query / todo items / server+tool names.
-/// Drops: WriteFile content, EditFile old/new strings, WebFetch prompt, Mcp/Unknown input.
+/// Keeps: command / path / pattern / url / query / todo items / server+tool names /
+/// task description+agent type.
+/// Drops: WriteFile content, EditFile old/new strings, WebFetch prompt, Task prompt,
+/// Mcp/Unknown input.
 /// Full inputs remain only in the host's local run journal. Idempotent.
 pub fn sanitize_tool_call(call: &ToolCall) -> ToolCall {
     match call {
@@ -424,6 +426,15 @@ pub fn sanitize_tool_call(call: &ToolCall) -> ToolCall {
             server: server.clone(),
             tool: tool.clone(),
             input: None,
+        },
+        ToolCall::Task {
+            description,
+            agent_type,
+            ..
+        } => ToolCall::Task {
+            description: description.clone(),
+            agent_type: agent_type.clone(),
+            prompt: None,
         },
         ToolCall::Unknown { name, .. } => ToolCall::Unknown {
             name: name.clone(),

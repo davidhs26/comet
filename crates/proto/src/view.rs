@@ -424,6 +424,17 @@ fn tool_chip_content_raw(call: &crate::ToolCall) -> (&'static str, String) {
             ("Todo", format!("{done}/{} done", items.len()))
         }
         ToolCall::Mcp { server, tool, .. } => ("MCP", format!("{server} · {tool}")),
+        ToolCall::Task {
+            description,
+            agent_type,
+            ..
+        } => (
+            "Agent",
+            match agent_type {
+                Some(agent) if !agent.is_empty() => format!("{agent} · {description}"),
+                _ => description.clone(),
+            },
+        ),
         ToolCall::Unknown { name, .. } => ("Tool", name.clone()),
     }
 }
@@ -465,7 +476,7 @@ pub fn tool_group_summary(tools: &[(crate::ToolCall, bool)]) -> String {
             }
             ToolCall::WebFetch { .. } => fetches += 1,
             ToolCall::Todo { .. } => todos += 1,
-            ToolCall::Mcp { .. } | ToolCall::Unknown { .. } => other += 1,
+            ToolCall::Mcp { .. } | ToolCall::Task { .. } | ToolCall::Unknown { .. } => other += 1,
         }
     }
     let mut segments: Vec<String> = Vec::new();

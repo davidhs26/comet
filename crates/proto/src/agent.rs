@@ -174,11 +174,46 @@ pub enum ToolCall {
         #[serde(skip_serializing_if = "Option::is_none")]
         input: Option<serde_json::Value>,
     },
+    /// A subagent run (Claude Code's Agent/Task tool). The id of the part
+    /// carrying this call doubles as the key into the harness's on-disk
+    /// subagent transcript (`SubagentTranscript` RPC).
+    Task {
+        description: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        agent_type: Option<String>,
+        /// Full subagent prompt; STRIPPED by the render-parts policy before
+        /// entering the doc (journal-only, like WriteFile content).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        prompt: Option<String>,
+    },
     Unknown {
         name: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         input: Option<serde_json::Value>,
     },
+}
+
+/// A subagent's transcript, read back from the harness's on-disk sidecar by
+/// the `SubagentTranscript` RPC (host-device local, like tool blobs).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubagentTranscript {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub entries: Vec<SubagentEntry>,
+    /// Entries dropped past the cap; 0 when complete.
+    #[serde(default)]
+    pub truncated_entries: usize,
+}
+
+/// One step of a subagent transcript: prose or a tool invocation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum SubagentEntry {
+    Text { text: String },
+    Tool { call: ToolCall },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -261,19 +261,13 @@ fn typed_call(update: &Value) -> ToolCall {
                 }
             }
         }
-        _ if raw_str("_toolName").as_deref() == Some("task") => ToolCall::Unknown {
-            name: raw_str("description")
+        _ if raw_str("_toolName").as_deref() == Some("task") => ToolCall::Task {
+            description: raw_str("description")
                 .filter(|d| d != "Subagent task")
-                .map(|d| format!("Task: {d}"))
                 .or_else(|| arg_from_title(&title))
-                .unwrap_or_else(|| {
-                    if title.is_empty() {
-                        "Task".into()
-                    } else {
-                        title
-                    }
-                }),
-            input: raw.cloned(),
+                .unwrap_or_default(),
+            agent_type: raw_str("subagent_type").or_else(|| raw_str("subagentType")),
+            prompt: raw_str("prompt"),
         },
         _ => ToolCall::Unknown {
             name: if title.is_empty() { kind.into() } else { title },
@@ -827,19 +821,17 @@ mod tests {
                 "_toolName": "task",
                 "description": "Look up multitask docs",
                 "prompt": "find the reminder",
+                "subagent_type": "Explore",
             },
         });
         assert_eq!(
             map_update(&update),
             vec![AgentEvent::ToolCall {
                 id: "t1".into(),
-                call: ToolCall::Unknown {
-                    name: "Task: Look up multitask docs".into(),
-                    input: Some(json!({
-                        "_toolName": "task",
-                        "description": "Look up multitask docs",
-                        "prompt": "find the reminder",
-                    })),
+                call: ToolCall::Task {
+                    description: "Look up multitask docs".into(),
+                    agent_type: Some("Explore".into()),
+                    prompt: Some("find the reminder".into()),
                 },
             }]
         );

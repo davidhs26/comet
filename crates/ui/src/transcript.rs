@@ -239,6 +239,10 @@ pub struct ToolItem {
     pub output_bytes: Option<u64>,
     /// Sidecar key of the full diff (doc carries only per-file stats).
     pub diff_ref: Option<SharedString>,
+    /// The part id of a Task (subagent) call — the harness-native tool_use id
+    /// that keys the subagent's on-disk transcript. Expanding offers a lazy
+    /// "Show subagent activity" fetch (`SubagentTranscript` RPC).
+    pub subagent_id: Option<SharedString>,
 }
 
 /// A chip's expandable detail payload.
@@ -391,6 +395,21 @@ pub fn call_block(call: &ToolCall) -> Option<ToolDetail> {
             ),
             None => format!("{server} · {tool}"),
         },
+        ToolCall::Task {
+            description,
+            agent_type,
+            prompt,
+        } => {
+            let mut text = match agent_type {
+                Some(agent) if !agent.is_empty() => format!("{agent} · {description}"),
+                _ => description.clone(),
+            };
+            if let Some(prompt) = prompt {
+                text.push('\n');
+                text.push_str(prompt);
+            }
+            text
+        }
         ToolCall::Unknown { name, input } => match input {
             Some(input) => format!(
                 "{name}\n{}",
@@ -714,6 +733,7 @@ pub fn rows_for_entry(
     for (part_ix, part) in entry.parts.iter().enumerate() {
         match part {
             MessagePart::Tool {
+                id: part_id,
                 call,
                 is_error,
                 resolved,
@@ -735,6 +755,8 @@ pub fn rows_for_entry(
                     output_ref: output_ref.clone().map(SharedString::from),
                     output_bytes: *output_bytes,
                     diff_ref: diff_ref.clone().map(SharedString::from),
+                    subagent_id: matches!(call, ToolCall::Task { .. })
+                        .then(|| SharedString::from(part_id.clone())),
                 });
                 group_last_part_ix = part_ix;
             }
@@ -1080,6 +1102,56 @@ fn blob_detail(text: &str, is_diff: bool) -> Option<ToolDetail> {
         .collect();
     while lines.last().is_some_and(|l| l.trim().is_empty()) {
         lines.pop();
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    let truncated_by = lines.len().saturating_sub(FULL_OUTPUT_MAX_LINES);
+    lines.truncate(FULL_OUTPUT_MAX_LINES);
+    Some(ToolDetail::Output {
+        lines,
+        truncated_by,
+    })
+}
+
+/// Build a fetched subagent transcript's detail block: one line per tool step
+/// (the chip vocabulary — "Run · cargo test"), prose blocks soft-wrapped like
+/// invocation lines. Reuses the output payload so rendering and the analytic
+/// height stay one implementation.
+fn subagent_detail(transcript: &zeron_proto::SubagentTranscript) -> Option<ToolDetail> {
+    let mut lines: Vec<SharedString> = Vec::new();
+    for entry in &transcript.entries {
+        match entry {
+            zeron_proto::SubagentEntry::Tool { call } => {
+                let (label, detail) = tool_chip_content(call);
+                lines.push(SharedString::from(if detail.is_empty() {
+                    label.to_owned()
+                } else {
+                    format!("{label} · {detail}")
+                }));
+            }
+            zeron_proto::SubagentEntry::Text { text } => {
+                // Claude Code writes ONE content block per row, so a single
+                // reply arrives as consecutive Text entries — separate them by
+                // exactly one blank line, never two.
+                if lines.last().is_some_and(|l| !l.is_empty()) {
+                    lines.push(SharedString::default());
+                }
+                for raw in text.lines() {
+                    lines.extend(wrap_cols(raw, CALL_WRAP_COLS));
+                }
+                lines.push(SharedString::default());
+            }
+        }
+    }
+    while lines.last().is_some_and(|l| l.trim().is_empty()) {
+        lines.pop();
+    }
+    if transcript.truncated_entries > 0 {
+        lines.push(SharedString::from(format!(
+            "… {} more steps",
+            transcript.truncated_entries
+        )));
     }
     if lines.is_empty() {
         return None;
@@ -1446,9 +1518,15 @@ pub struct Transcript {
     /// Deliberately NOT cleared on chat switch: refs are chat-qualified and a
     /// fetched blob stays valid.
     blob_details: HashMap<SharedString, BlobFetch>,
-    /// Monotonic fetch order per blob ref: when a tool has BOTH a diff and
-    /// an output blob fetched, the chip shows the one requested most
-    /// recently (click "Show full output" after a diff → see the output).
+    /// Subagent transcripts keyed by the Task call's tool id — the same
+    /// lifecycle and upgrade rules as `blob_details`, fetched from the chat's
+    /// host device instead of the edge. Kept across chat switches for the same
+    /// reason: a tool id names one call forever.
+    subagent_details: HashMap<SharedString, BlobFetch>,
+    /// Monotonic fetch order per target (see [`FetchTarget::order_key`]): when
+    /// a tool has BOTH a diff and an output blob fetched, the chip shows the
+    /// one requested most recently (click "Show full output" after a diff →
+    /// see the output).
     blob_fetch_order: HashMap<SharedString, u64>,
     blob_fetch_counter: u64,
     _observe: Subscription,
@@ -1460,6 +1538,48 @@ enum BlobFetch {
     /// Failed with the affordance re-armed as a retry.
     Failed,
     Ready(Arc<ToolDetail>),
+}
+
+/// What an expanded chip's fetch affordance pulls: a sidecar blob (full output
+/// or diff, edge-direct) or a subagent transcript (host-device disk). Both
+/// upgrade the chip's detail in place, so they share the recency ordering.
+#[derive(Debug, Clone, PartialEq)]
+enum FetchTarget {
+    Blob(SharedString),
+    Subagent(SharedString),
+}
+
+impl FetchTarget {
+    /// Key into the shared recency map. Namespaced because the two id spaces
+    /// are unrelated (`chatId/partId` vs a harness tool id).
+    fn order_key(&self) -> SharedString {
+        match self {
+            FetchTarget::Blob(r) => r.clone(),
+            FetchTarget::Subagent(id) => SharedString::from(format!("sub:{id}")),
+        }
+    }
+}
+
+/// Every lazily-fetchable upgrade a chip offers — `(target, noun, size)` — in
+/// the order the affordance row prefers them. A subagent transcript comes
+/// first: for a Task chip it is the whole story, and the doc-resident detail
+/// is just the description line.
+fn fetch_targets(tool: &ToolItem) -> Vec<(FetchTarget, &'static str, Option<u64>)> {
+    let mut out = Vec::new();
+    if let Some(id) = &tool.subagent_id {
+        out.push((FetchTarget::Subagent(id.clone()), "subagent activity", None));
+    }
+    if let Some(r) = &tool.diff_ref {
+        out.push((FetchTarget::Blob(r.clone()), "full diff", None));
+    }
+    if let Some(r) = &tool.output_ref {
+        out.push((
+            FetchTarget::Blob(r.clone()),
+            "full output",
+            tool.output_bytes,
+        ));
+    }
+    out
 }
 
 impl Transcript {
@@ -1514,6 +1634,7 @@ impl Transcript {
             attachment_loads: HashMap::new(),
             attachment_retries: HashMap::new(),
             blob_details: HashMap::new(),
+            subagent_details: HashMap::new(),
             blob_fetch_order: HashMap::new(),
             blob_fetch_counter: 0,
             _observe: observe,
@@ -2406,6 +2527,101 @@ impl Transcript {
         self.blob_details.insert(blob_ref, BlobFetch::Loading(task));
     }
 
+    /// Lifecycle of a fetch target, whichever store backs it.
+    fn fetch_state(&self, target: &FetchTarget) -> Option<&BlobFetch> {
+        match target {
+            FetchTarget::Blob(r) => self.blob_details.get(r),
+            FetchTarget::Subagent(id) => self.subagent_details.get(id),
+        }
+    }
+
+    fn fetch_order(&self, target: &FetchTarget) -> u64 {
+        self.blob_fetch_order
+            .get(&target.order_key())
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn spawn_fetch(&mut self, target: FetchTarget, cx: &mut Context<Self>) {
+        match target {
+            FetchTarget::Blob(r) => self.spawn_blob_fetch(r, cx),
+            FetchTarget::Subagent(id) => self.spawn_subagent_fetch(id, cx),
+        }
+    }
+
+    /// Fetch a Task call's subagent transcript — the steps the subagent ran,
+    /// which never cross the ACP wire — from the chat's host device, and build
+    /// its detail once, off the render path. Same re-entry rules as
+    /// [`Self::spawn_blob_fetch`]: Ready re-ranks, Loading no-ops, Failed
+    /// re-arms as a retry.
+    fn spawn_subagent_fetch(&mut self, tool_call_id: SharedString, cx: &mut Context<Self>) {
+        self.blob_fetch_counter += 1;
+        self.blob_fetch_order.insert(
+            FetchTarget::Subagent(tool_call_id.clone()).order_key(),
+            self.blob_fetch_counter,
+        );
+        match self.subagent_details.get(&tool_call_id) {
+            Some(BlobFetch::Ready(_)) => {
+                cx.notify();
+                return;
+            }
+            Some(BlobFetch::Loading(_)) => return,
+            Some(BlobFetch::Failed) | None => {}
+        }
+        let Some(chat_id) = self.chat_id.clone() else {
+            return;
+        };
+        // The sidecar files live on the chat's HOST device; target the relay
+        // when that isn't us (the engine rejects a foreign chat outright).
+        let (engine, target_device) = {
+            let state = self.state.read(cx);
+            let Some(engine) = state.engine().cloned() else {
+                return;
+            };
+            let target = state
+                .chats
+                .iter()
+                .find(|c| c.id == chat_id)
+                .map(|c| c.device_id.clone())
+                .filter(|d| state.local_device_id.as_deref() != Some(d.as_str()));
+            (engine, target)
+        };
+        let key = tool_call_id.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let mut params = serde_json::json!({
+                "chatId": chat_id,
+                "toolCallId": key.as_ref(),
+            });
+            if let (Some(target), Some(map)) = (target_device, params.as_object_mut()) {
+                map.insert("targetDeviceId".into(), target.into());
+            }
+            let reply = crate::attachments::call_with_timeout(
+                &engine,
+                cx.background_executor(),
+                zeron_rpc::methods::SUBAGENT_TRANSCRIPT,
+                params,
+                Duration::from_secs(20),
+            )
+            .await;
+            let fetched = match reply {
+                Ok(value) => serde_json::from_value::<zeron_proto::SubagentTranscript>(value)
+                    .ok()
+                    .as_ref()
+                    .and_then(subagent_detail)
+                    .map(|d| BlobFetch::Ready(Arc::new(d)))
+                    .unwrap_or(BlobFetch::Failed),
+                Err(_) => BlobFetch::Failed,
+            };
+            this.update(cx, |this, cx| {
+                this.subagent_details.insert(key, fetched);
+                cx.notify();
+            })
+            .ok();
+        });
+        self.subagent_details
+            .insert(tool_call_id, BlobFetch::Loading(task));
+    }
+
     fn toggle_fold(&mut self, row_id: SharedString, open_height: f32, auto_open: bool) {
         let entry = self.folds.entry(row_id).or_default();
         let currently_open = entry.open.unwrap_or(auto_open);
@@ -3088,9 +3304,9 @@ impl Transcript {
                 // a tool can carry both a diff and an output ref, and the
                 // user's last click decides which upgrade is showing.
                 let mut best: Option<(u64, Arc<ToolDetail>)> = None;
-                for blob_ref in [&tool.diff_ref, &tool.output_ref].into_iter().flatten() {
-                    if let Some(BlobFetch::Ready(detail)) = self.blob_details.get(blob_ref) {
-                        let order = self.blob_fetch_order.get(blob_ref).copied().unwrap_or(0);
+                for (target, _, _) in fetch_targets(tool) {
+                    if let Some(BlobFetch::Ready(detail)) = self.fetch_state(&target) {
+                        let order = self.fetch_order(&target);
                         if best.as_ref().is_none_or(|(o, _)| order > *o) {
                             best = Some((order, detail.clone()));
                         }
@@ -3108,47 +3324,43 @@ impl Transcript {
         // upgrade), then the output — a fetched ref hands the affordance to
         // the NEXT unfetched one instead of retiring it (both must stay
         // reachable when a tool has both).
-        let affordances: Vec<Option<(SharedString, SharedString)>> = tools
+        let affordances: Vec<Option<(FetchTarget, SharedString)>> = tools
             .iter()
             .map(|tool| {
-                // The currently-displayed ref (same recency rule as
+                let targets = fetch_targets(tool);
+                // The currently-displayed target (same recency rule as
                 // `details` above): its affordance is spent; any OTHER
-                // Ready ref stays offered as a no-fetch toggle.
-                let shown: Option<&SharedString> = {
-                    let mut best: Option<(u64, &SharedString)> = None;
-                    for blob_ref in [&tool.diff_ref, &tool.output_ref].into_iter().flatten() {
-                        if matches!(self.blob_details.get(blob_ref), Some(BlobFetch::Ready(_))) {
-                            let order = self.blob_fetch_order.get(blob_ref).copied().unwrap_or(0);
+                // Ready target stays offered as a no-fetch toggle.
+                let shown: Option<FetchTarget> = {
+                    let mut best: Option<(u64, &FetchTarget)> = None;
+                    for (target, _, _) in &targets {
+                        if matches!(self.fetch_state(target), Some(BlobFetch::Ready(_))) {
+                            let order = self.fetch_order(target);
                             if best.is_none_or(|(o, _)| order > o) {
-                                best = Some((order, blob_ref));
+                                best = Some((order, target));
                             }
                         }
                     }
-                    best.map(|(_, r)| r)
+                    best.map(|(_, t)| t.clone())
                 };
-                let candidates = [
-                    (tool.diff_ref.as_ref(), "diff", None),
-                    (tool.output_ref.as_ref(), "output", tool.output_bytes),
-                ];
-                for (blob_ref, what, bytes) in candidates {
-                    let Some(blob_ref) = blob_ref else { continue };
-                    let label = match self.blob_details.get(blob_ref) {
+                for (target, what, bytes) in targets {
+                    let label = match self.fetch_state(&target) {
                         Some(BlobFetch::Ready(_)) => {
-                            if shown == Some(blob_ref) {
+                            if shown.as_ref() == Some(&target) {
                                 continue;
                             }
-                            format!("Show full {what}")
+                            format!("Show {what}")
                         }
-                        Some(BlobFetch::Loading(_)) => format!("Loading full {what}…"),
+                        Some(BlobFetch::Loading(_)) => format!("Loading {what}…"),
                         Some(BlobFetch::Failed) => {
-                            format!("Couldn't load full {what} — tap to retry")
+                            format!("Couldn't load {what} — tap to retry")
                         }
                         None => match bytes {
-                            Some(b) => format!("Show full {what} ({})", format_kb(b)),
-                            None => format!("Show full {what}"),
+                            Some(b) => format!("Show {what} ({})", format_kb(b)),
+                            None => format!("Show {what}"),
                         },
                     };
-                    return Some((blob_ref.clone(), SharedString::from(label)));
+                    return Some((target, SharedString::from(label)));
                 }
                 None
             })
@@ -3363,11 +3575,9 @@ impl Transcript {
                             )
                             .child(detail_body(detail, detail_highlights[ix].clone(), theme));
                     }
-                    if let Some((blob_ref, label)) = affordance {
-                        let loading = matches!(
-                            self.blob_details.get(&blob_ref),
-                            Some(BlobFetch::Loading(_))
-                        );
+                    if let Some((target, label)) = affordance {
+                        let loading =
+                            matches!(self.fetch_state(&target), Some(BlobFetch::Loading(_)));
                         let mut row = div()
                             .id(SharedString::from(format!("{key}-blob")))
                             .h(px(BLOB_AFFORDANCE_HEIGHT))
@@ -3383,7 +3593,7 @@ impl Transcript {
                                 .cursor_pointer()
                                 .hover(|s| s.text_color(theme.text_muted))
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.spawn_blob_fetch(blob_ref.clone(), cx);
+                                    this.spawn_fetch(target.clone(), cx);
                                     cx.notify();
                                 }));
                         }
@@ -3682,6 +3892,7 @@ fn tool_icon_path(call: &ToolCall) -> &'static str {
         ToolCall::Glob { .. } => crate::icons::FOLDER_WITH_FILES,
         ToolCall::WebFetch { .. } | ToolCall::WebSearch { .. } => crate::icons::GLOBAL,
         ToolCall::Todo { .. } => crate::icons::CHECKLIST,
+        ToolCall::Task { .. } => crate::icons::CHAT_ROUND_LINE,
         ToolCall::Mcp { .. } | ToolCall::Unknown { .. } => crate::icons::WIDGET,
     }
 }
@@ -4588,6 +4799,118 @@ mod tests {
     }
 
     #[test]
+    fn subagent_detail_lists_steps_in_chip_language() {
+        use zeron_proto::{SubagentEntry, SubagentTranscript};
+        let transcript = SubagentTranscript {
+            agent_type: Some("Explore".into()),
+            description: Some("Map the repo".into()),
+            entries: vec![
+                SubagentEntry::Text {
+                    text: "Scanning.".into(),
+                },
+                SubagentEntry::Tool {
+                    call: ToolCall::Exec {
+                        command: "ls crates".into(),
+                    },
+                },
+                SubagentEntry::Tool {
+                    call: ToolCall::ReadFile {
+                        path: "a/b.rs".into(),
+                    },
+                },
+            ],
+            truncated_entries: 3,
+        };
+        let Some(ToolDetail::Output {
+            lines,
+            truncated_by,
+        }) = subagent_detail(&transcript)
+        else {
+            panic!("expected an output block");
+        };
+        assert_eq!(truncated_by, 0);
+        assert_eq!(
+            lines.iter().map(|l| l.as_ref()).collect::<Vec<_>>(),
+            vec![
+                "Scanning.",
+                "",
+                "Run · ls crates",
+                "Read · a/b.rs",
+                "… 3 more steps",
+            ]
+        );
+        // An empty transcript has nothing to show (no empty card).
+        assert!(
+            subagent_detail(&SubagentTranscript {
+                agent_type: None,
+                description: None,
+                entries: Vec::new(),
+                truncated_entries: 0,
+            })
+            .is_none()
+        );
+        // Claude Code splits one reply across rows, so consecutive Text
+        // entries are the norm — they get ONE blank line between them.
+        let split = SubagentTranscript {
+            agent_type: None,
+            description: None,
+            entries: vec![
+                SubagentEntry::Text {
+                    text: "Done.".into(),
+                },
+                SubagentEntry::Text {
+                    text: "Report body.".into(),
+                },
+            ],
+            truncated_entries: 0,
+        };
+        let Some(ToolDetail::Output { lines, .. }) = subagent_detail(&split) else {
+            panic!("expected an output block");
+        };
+        assert_eq!(
+            lines.iter().map(|l| l.as_ref()).collect::<Vec<_>>(),
+            vec!["Done.", "", "Report body."]
+        );
+    }
+
+    #[test]
+    fn task_chip_offers_the_subagent_affordance() {
+        let task = ToolItem {
+            call: ToolCall::Task {
+                description: "Map the repo".into(),
+                agent_type: Some("Explore".into()),
+                prompt: None,
+            },
+            is_error: false,
+            resolved: true,
+            detail: None,
+            invocation: None,
+            output_ref: None,
+            output_bytes: None,
+            diff_ref: None,
+            subagent_id: Some("toolu_abc".into()),
+        };
+        let targets = fetch_targets(&task);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].0, FetchTarget::Subagent("toolu_abc".into()));
+        assert_eq!(targets[0].1, "subagent activity");
+        // The chip reads as an agent run, not a generic tool.
+        assert_eq!(
+            tool_chip_content(&task.call),
+            ("Agent", "Explore · Map the repo".to_string())
+        );
+        // A plain tool offers nothing to fetch when the doc carries it all.
+        let exec = ToolItem {
+            call: ToolCall::Exec {
+                command: "ls".into(),
+            },
+            subagent_id: None,
+            ..task
+        };
+        assert!(fetch_targets(&exec).is_empty());
+    }
+
+    #[test]
     fn tool_group_summaries() {
         let exec = |c: &str| ToolItem {
             call: ToolCall::Exec { command: c.into() },
@@ -4598,6 +4921,7 @@ mod tests {
             output_ref: None,
             output_bytes: None,
             diff_ref: None,
+            subagent_id: None,
         };
         let edit = |p: &str| ToolItem {
             call: ToolCall::EditFile {
@@ -4612,6 +4936,7 @@ mod tests {
             output_ref: None,
             output_bytes: None,
             diff_ref: None,
+            subagent_id: None,
         };
         let tools = vec![
             exec("ls"),
@@ -4642,6 +4967,7 @@ mod tests {
                 output_ref: None,
                 output_bytes: None,
                 diff_ref: None,
+                subagent_id: None,
             },
             ToolItem {
                 call: ToolCall::Glob {
@@ -4654,6 +4980,7 @@ mod tests {
                 output_ref: None,
                 output_bytes: None,
                 diff_ref: None,
+                subagent_id: None,
             },
             ToolItem {
                 call: ToolCall::WebSearch { query: "q".into() },
@@ -4664,6 +4991,7 @@ mod tests {
                 output_ref: None,
                 output_bytes: None,
                 diff_ref: None,
+                subagent_id: None,
             },
         ];
         assert_eq!(tool_group_summary(&tools), "Read 1 file · searched 2 times");

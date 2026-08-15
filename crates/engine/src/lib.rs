@@ -29,6 +29,7 @@ pub mod rpc;
 pub mod run_journal;
 pub mod sessions;
 pub mod spaces;
+pub mod subagents;
 pub mod terminals;
 pub mod titles;
 pub mod uploads;
