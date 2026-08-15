@@ -26,7 +26,7 @@ use zeron_engine::InstanceLock;
 use zeron_proto::{AuthState, WorkspaceScope};
 use zeron_rpc::methods;
 
-use crate::changes::{Changes, ChangesEvent};
+use crate::changes::{Changes, ChangesEvent, DiffScope};
 use crate::composer::{Composer, ComposerEvent, ComposerInput, ComposerInputEvent};
 use crate::icons::{self, icon};
 use crate::loaders;
@@ -50,7 +50,7 @@ use crate::state::{
 };
 use crate::terminal::panel::{TerminalPanel, ToggleTerminal, clamp_terminal_height};
 use crate::theme::Theme;
-use crate::transcript::{self, Transcript};
+use crate::transcript::{self, Transcript, TranscriptEvent};
 
 mod spaces;
 mod tabs;
@@ -917,6 +917,7 @@ pub struct Shell {
     _ticker: Task<()>,
     _state_observation: Subscription,
     _composer_events: Subscription,
+    _transcript_events: Subscription,
 }
 
 impl Shell {
@@ -942,6 +943,14 @@ impl Shell {
                 }
             }
         });
+        // Turn-summary card clicks: the transcript can't reach the panes, so
+        // the shell reveals the turn diff on its behalf.
+        let transcript_events = cx.subscribe(
+            &transcript,
+            |this: &mut Shell, _, event: &TranscriptEvent, cx| match event {
+                TranscriptEvent::OpenTurnDiff => this.show_turn_diff(cx),
+            },
+        );
         // Working-indicator heartbeat: notify once a second while a session is
         // live so elapsed time and the flavour word stay fresh.
         let ticker = cx.spawn(async move |this, cx| {
@@ -1093,6 +1102,7 @@ impl Shell {
             _ticker: ticker,
             _state_observation: observation,
             _composer_events: composer_events,
+            _transcript_events: transcript_events,
         }
     }
 
@@ -1565,6 +1575,42 @@ impl Shell {
             .or_default()
             .push(RightSurface::Diff(id));
         self.set_right_active(RightSurface::Diff(id), cx);
+    }
+
+    /// A transcript turn-summary card click: reveal the turn's diff in the
+    /// right-hand pane. Closed → the pane opens onto a turn-scoped diff tab;
+    /// open → the chat's existing "Latest turn" tab activates, else a fresh
+    /// one opens (per-commit History tabs set the precedent for minting tabs
+    /// from content clicks).
+    fn show_turn_diff(&mut self, cx: &mut Context<Self>) {
+        if !self.right_pane_open(cx) {
+            self.toggle_right_pane(cx);
+        }
+        // Reuse the chat's existing latest-turn tab — one click per turn must
+        // not pile up identical tabs. Commit-pinned panes can't match: their
+        // scope is `Commit`, never `LatestTurn`.
+        let key = self.panel_key(cx);
+        let existing = self
+            .right_tabs
+            .get(&key)
+            .into_iter()
+            .flatten()
+            .find(|surface| match surface {
+                RightSurface::Diff(id) => self
+                    .diffs
+                    .get(id)
+                    .is_some_and(|c| c.read(cx).scope() == DiffScope::LatestTurn),
+                _ => false,
+            })
+            .copied();
+        match existing {
+            Some(surface) => self.set_right_active(surface, cx),
+            None => {
+                let changes =
+                    cx.new(|cx| Changes::for_scope(self.state.clone(), DiffScope::LatestTurn, cx));
+                self.register_diff_surface(changes, cx);
+            }
+        }
     }
 
     /// The picker's Terminal card / the `+` menu's Terminal row: every click
