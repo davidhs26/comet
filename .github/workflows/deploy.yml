@@ -9,8 +9,6 @@ name: deploy
 # Workers R2 Storage (edit). Account id is pinned in edge/wrangler.jsonc.
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
 
 concurrency:

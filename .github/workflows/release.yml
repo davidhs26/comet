@@ -12,8 +12,6 @@ name: release
 # workflow_dispatch (builds + uploads artifacts, no release/R2 publish).
 
 on:
-  push:
-    tags: ["v*"]
   workflow_dispatch:
 
 permissions:
