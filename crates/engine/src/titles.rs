@@ -35,6 +35,11 @@ use crate::workspace_host::WorkspaceHost;
 /// couple of times with a short backoff before falling back (zeron's ladder).
 const RETRY_DELAYS_MS: &[u64] = &[250, 1_000];
 
+/// Prefix of the machine-to-machine titling prompt. `pi_adopt` matches on this
+/// prefix to skip titling sessions as noise — keep both sides in sync by
+/// construction (this constant is the single source of truth).
+pub(crate) const TITLE_PROMPT_PREFIX: &str = "Reply with ONLY a concise";
+
 struct Inner {
     workspace: WorkspaceHost,
     registry: Arc<HarnessRegistry>,
@@ -157,7 +162,7 @@ impl TitleGenerator {
         };
         let cheap = cheapest_model(&harness.models().await.unwrap_or_default());
         let title_prompt = format!(
-            "Reply with ONLY a concise 3-5 word title in Title Case (no quotes, no punctuation) \
+            "{TITLE_PROMPT_PREFIX} 3-5 word title in Title Case (no quotes, no punctuation) \
              for a coding session that begins with this request:\n\n{prompt}"
         );
         for attempt in 0..=RETRY_DELAYS_MS.len() {

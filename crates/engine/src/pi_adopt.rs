@@ -18,6 +18,11 @@
 //! The whole module is best-effort: any read/parse failure is logged and
 //! skipped, never propagated — adoption must not take the engine down.
 //!
+//! The noise filters below only stop NEW adoptions; they never delete rows.
+//! Historical cleanup of chats adopted before a filter existed (e.g. legacy
+//! /tmp sessions) is an operator task (`~/zeron-purge.mjs` via IPC `Mutate
+//! deleteChat`), not something this filter does.
+//!
 //! Feature flag: `ZERON_ADOPT_PI_SESSIONS=1` (any other value or absent =
 //! off, silently — zero logs, zero tasks when off).
 
@@ -333,11 +338,15 @@ fn is_ephemeral_cwd(cwd: &str) -> bool {
         || p.starts_with("/var/tmp/")
         || p == "/private/tmp"
         || p.starts_with("/private/tmp/")
+        || p == "/private/var/tmp" // macOS symlink target of /var/tmp
+        || p.starts_with("/private/var/tmp/")
 }
 
 /// Machine-to-machine utility prompts (title generation and similar) that
-/// produce pi sessions but are not conversations anyone wants listed.
-const UTILITY_PROMPT_PREFIXES: &[&str] = &["Reply with ONLY a concise"];
+/// produce pi sessions but are not conversations anyone wants listed. The
+/// title prefix is owned by `titles::TITLE_PROMPT_PREFIX` so the titling
+/// prompt and this filter cannot drift apart.
+const UTILITY_PROMPT_PREFIXES: &[&str] = &[crate::titles::TITLE_PROMPT_PREFIX];
 
 fn is_utility_prompt(first_user_text: &str) -> bool {
     let t = first_user_text.trim_start();
@@ -405,7 +414,7 @@ fn adopt_session(workspace: &WorkspaceHost, namespace: &uuid::Uuid, entry: &PiSe
     // Noise filter: internal utility prompts (e.g. the title generator) are
     // machine-to-machine calls, not conversations.
     if is_utility_prompt(user_text) {
-        tracing::debug!(
+        tracing::info!(
             pi_session = %entry.session_id,
             "pi-adopt: skip utility-prompt session"
         );
@@ -622,8 +631,11 @@ mod tests {
     #[test]
     fn ephemeral_cwd_is_noise() {
         assert!(is_ephemeral_cwd("/tmp"));
+        assert!(is_ephemeral_cwd("/tmp/"));
         assert!(is_ephemeral_cwd("/tmp/pw2-e2e-x/workspaces/j1"));
         assert!(is_ephemeral_cwd("/var/tmp/x"));
+        assert!(is_ephemeral_cwd("/private/tmp/x"));
+        assert!(is_ephemeral_cwd("/private/var/tmp/x"));
         assert!(!is_ephemeral_cwd("/home/david/tmpwork"));
         assert!(!is_ephemeral_cwd("/home/david/factory"));
     }
@@ -635,6 +647,18 @@ mod tests {
         ));
         assert!(is_utility_prompt("  Reply with ONLY a concise title"));
         assert!(!is_utility_prompt("Sos la sesion de prueba PW1"));
+    }
+
+    #[test]
+    fn utility_prefix_matches_the_real_titling_prompt() {
+        // The filter must keep matching the prompt `titles.rs` actually sends:
+        // both sides are built from the same constant.
+        let real_prompt = format!(
+            "{} 3-5 word title in Title Case (no quotes, no punctuation) \
+             for a coding session that begins with this request:\n\nfix the bug",
+            crate::titles::TITLE_PROMPT_PREFIX
+        );
+        assert!(is_utility_prompt(&real_prompt));
     }
 
     #[test]
