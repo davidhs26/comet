@@ -22,6 +22,7 @@ pub mod diff_sync;
 pub mod doc_host;
 pub mod instance_lock;
 pub mod local_import;
+pub mod pi_adopt;
 pub mod profile;
 pub mod registry;
 pub mod repos;
@@ -115,6 +116,9 @@ pub struct EngineCore {
     pub terminals: Terminals,
     pub diff_sync: CheckoutDiffSync,
     pub spaces_sync: SpacesSync,
+    /// External pi-session adoption loop (present only when the feature
+    /// flag is on).
+    pub pi_adopt: Option<pi_adopt::PiAdopt>,
     pub uploads: Uploads,
     pub agent_accounts: AgentAccounts,
     pub device_id: String,
@@ -268,6 +272,8 @@ impl EngineCore {
             turn_diff.note_turn_start(chat_id, cwd);
         }));
         let spaces_sync = SpacesSync::start(repos.clone(), workspace.clone(), &device_id);
+        // Adopt external pi sessions (feature-flagged; None = off, silent).
+        let pi_adopt = pi_adopt::PiAdopt::start(workspace.clone());
         Ok(Self {
             sessions,
             doc_host,
@@ -277,6 +283,7 @@ impl EngineCore {
             terminals,
             diff_sync,
             spaces_sync,
+            pi_adopt,
             uploads,
             agent_accounts,
             device_id,
@@ -460,6 +467,9 @@ impl EngineCore {
         }
         self.diff_sync.shutdown().await;
         self.spaces_sync.shutdown().await;
+        if let Some(pi_adopt) = &self.pi_adopt {
+            pi_adopt.shutdown().await;
+        }
         self.doc_host.shutdown_workers().await;
         self.doc_host.flush_all();
         self.workspace.shutdown();

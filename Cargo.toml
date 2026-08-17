@@ -79,7 +79,7 @@ async-trait = "0.1"
 # serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-uuid = { version = "1", features = ["v4", "serde"] }
+uuid = { version = "1", features = ["v4", "v5", "serde"] }
 
 # storage
 rusqlite = { version = "0.32", features = ["bundled"] }
