@@ -323,12 +323,42 @@ fn chat_id_for(namespace: &uuid::Uuid, session_id: &str) -> String {
     uuid::Uuid::new_v5(namespace, session_id.as_bytes()).to_string()
 }
 
+/// Ephemeral working directories whose sessions are never worth listing
+/// (test workspaces, scratch dirs) - they churn constantly and are not chats.
+fn is_ephemeral_cwd(cwd: &str) -> bool {
+    let p = cwd.trim_end_matches('/');
+    p == "/tmp"
+        || p.starts_with("/tmp/")
+        || p == "/var/tmp"
+        || p.starts_with("/var/tmp/")
+        || p == "/private/tmp"
+        || p.starts_with("/private/tmp/")
+}
+
+/// Machine-to-machine utility prompts (title generation and similar) that
+/// produce pi sessions but are not conversations anyone wants listed.
+const UTILITY_PROMPT_PREFIXES: &[&str] = &["Reply with ONLY a concise"];
+
+fn is_utility_prompt(first_user_text: &str) -> bool {
+    let t = first_user_text.trim_start();
+    UTILITY_PROMPT_PREFIXES.iter().any(|p| t.starts_with(p))
+}
+
 /// Adopt one session: skip silently when already known, empty, or malformed.
 fn adopt_session(workspace: &WorkspaceHost, namespace: &uuid::Uuid, entry: &PiSession) {
     if entry.session_id.is_empty() || entry.cwd.is_empty() {
         tracing::debug!(
             file = ?entry.session_file,
             "pi-adopt: skip session with empty id or cwd"
+        );
+        return;
+    }
+    // Noise filter: ephemeral workdirs are never worth listing.
+    if is_ephemeral_cwd(&entry.cwd) {
+        tracing::debug!(
+            pi_session = %entry.session_id,
+            cwd = %entry.cwd,
+            "pi-adopt: skip session in ephemeral cwd"
         );
         return;
     }
@@ -371,6 +401,16 @@ fn adopt_session(workspace: &WorkspaceHost, namespace: &uuid::Uuid, entry: &PiSe
         );
         return;
     };
+
+    // Noise filter: internal utility prompts (e.g. the title generator) are
+    // machine-to-machine calls, not conversations.
+    if is_utility_prompt(user_text) {
+        tracing::debug!(
+            pi_session = %entry.session_id,
+            "pi-adopt: skip utility-prompt session"
+        );
+        return;
+    }
 
     let title = extract_title(Some(user_text), &entry.cwd);
     let updated_at = entry
@@ -577,6 +617,24 @@ mod tests {
         // No user text → cwd basename fallback.
         assert_eq!(extract_title(None, "/tmp/factory"), "factory");
         assert_eq!(extract_title(Some("   "), "/tmp/factory"), "factory");
+    }
+
+    #[test]
+    fn ephemeral_cwd_is_noise() {
+        assert!(is_ephemeral_cwd("/tmp"));
+        assert!(is_ephemeral_cwd("/tmp/pw2-e2e-x/workspaces/j1"));
+        assert!(is_ephemeral_cwd("/var/tmp/x"));
+        assert!(!is_ephemeral_cwd("/home/david/tmpwork"));
+        assert!(!is_ephemeral_cwd("/home/david/factory"));
+    }
+
+    #[test]
+    fn utility_prompts_are_noise() {
+        assert!(is_utility_prompt(
+            "Reply with ONLY a concise 3-5 word title in Title Case (no quotes)"
+        ));
+        assert!(is_utility_prompt("  Reply with ONLY a concise title"));
+        assert!(!is_utility_prompt("Sos la sesion de prueba PW1"));
     }
 
     #[test]
