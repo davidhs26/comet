@@ -22,6 +22,7 @@ pub mod diff_sync;
 pub mod doc_host;
 pub mod instance_lock;
 pub mod local_import;
+pub mod model_allowlist;
 pub mod pi_adopt;
 pub mod profile;
 pub mod registry;

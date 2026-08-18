@@ -1018,6 +1018,10 @@ impl RpcService for EngineRpc {
                     .models()
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
+                // Fork: trim the picker to the owner's curated set via
+                // ~/.zeron/model-allowlist.json (see model_allowlist.rs).
+                // Absent/corrupt/empty/non-matching config passes through.
+                let models = crate::model_allowlist::apply_for(p.harness, models);
                 RpcReply::value(&models)
             }
             methods::LIST_COMMANDS => {
