@@ -8,9 +8,13 @@ import { EventEmitter } from "node:events";
 import * as path from "node:path";
 import * as url from "node:url";
 
+// El harness de subagentes setea PI_SUBAGENT_DEPTH=1; sin esto los tests que
+// no inyectan env heredan process.env y canSpawn rechaza el batch.
+delete process.env.PI_SUBAGENT_DEPTH;
+
 const here = import.meta.dirname;
 const mod = await import(url.pathToFileURL(path.join(here, "subagents.ts")).href);
-const { resolveRoute, canSpawn, assertReviewerDistinct, trimTail, createSubagentsRuntime, ROUTES, modelKey, chooseDeliverAs, formatSubagentResult, installSubagents } = mod;
+const { resolveRoute, canSpawn, assertReviewerDistinct, trimTail, createSubagentsRuntime, ROUTES, modelKey, chooseDeliverAs, formatSubagentResult, installSubagents, sumUsage, usageFromSessionJsonl, parseMaxCostUsd, formatBatchSummary } = mod;
 
 let passed = 0;
 const failures = [];
@@ -178,9 +182,16 @@ await test("cap 4 vivos: 8 tasks, nunca más de 4 procesos simultáneos", async 
 	assert.ok(results.every((r) => r.exitCode === 0));
 });
 
-await test("spawn args: PI absoluto + flags del spec + env hijo PI_SUBAGENT_DEPTH=1", async () => {
+await test("spawn args: PI absoluto + --session-dir (no --no-session) + env hijo PI_SUBAGENT_DEPTH=1", async () => {
 	const fake = makeFakeSpawn();
-	const rt = createSubagentsRuntime({ spawnFn: fake.spawnFn, piBin: "/fake/pi" });
+	const rt = createSubagentsRuntime({
+		spawnFn: fake.spawnFn,
+		piBin: "/fake/pi",
+		sessionRoot: "/fake/sessions",
+		now: () => 5000,
+		mkdirSessionDir: () => {},
+		rmSessionDir: () => {},
+	});
 	const batch = rt.runBatch([{ role: "review", prompt: "mirá" }]);
 	await tick();
 	const proc = fake.procs[0];
@@ -191,8 +202,9 @@ await test("spawn args: PI absoluto + flags del spec + env hijo PI_SUBAGENT_DEPT
 		"--provider", "kimi-coding",
 		"--model", "k3",
 		"--thinking", "high",
-		"-p", "--no-session", "mirá",
+		"-p", "--session-dir", `/fake/sessions/${process.pid}-5000-1/t1`, "mirá",
 	]);
+	assert.ok(!fake.argss[0].includes("--no-session"), "434: ya no se pasa --no-session");
 	assert.equal(proc.spawnOpts.env.PI_SUBAGENT_DEPTH, "1");
 	assert.equal(proc.spawnOpts.stdio[0], "ignore");
 });
@@ -286,10 +298,10 @@ await test("chooseDeliverAs: agente vivo → steer, idle → nextTurn", () => {
 	assert.equal(chooseDeliverAs(false), "nextTurn");
 });
 
-await test("formatSubagentResult: formato congelado del spec", () => {
+await test("formatSubagentResult: formato congelado del spec (434: costBit)", () => {
 	assert.equal(
-		formatSubagentResult({ id: "t1", role: "review", model: "kimi-coding/k3", exitCode: 0, durationMs: 1234, output: "hola" }),
-		"[subagent t1 · review · kimi-coding/k3 · 1.2s · exit 0]\nhola",
+		formatSubagentResult({ id: "t1", role: "review", model: "kimi-coding/k3", exitCode: 0, durationMs: 1234, output: "hola", usage: { input: 10, output: 20, cacheRead: 5, costUsd: 0.01 } }),
+		"[subagent t1 · review · kimi-coding/k3 · 1.2s · exit 0 · ~$0.01]\nhola",
 	);
 });
 
@@ -602,6 +614,217 @@ await test("installSubagents: steer si live, nextTurn si idle, nada post-shutdow
 	assert.equal(sent.length, 2, "post-shutdown no manda sendMessage");
 });
 
+// ---------- ID01-434: usage/costo + presupuesto + envelope ----------
+
+await test("usageFromSessionJsonl: suma assistant+toolResult+compaction; costUsd solo si hay cost.total", () => {
+	const jsonl = [
+		JSON.stringify({ type: "message", message: { role: "assistant", usage: { input: 100, output: 20, cacheRead: 5, cost: { total: 0.01 } } } }),
+		JSON.stringify({ type: "message", message: { role: "toolResult", usage: { input: 10, output: 0, cacheRead: 0 } } }),
+		JSON.stringify({ type: "compaction", usage: { input: 1, output: 2, cacheRead: 3 } }),
+		JSON.stringify({ type: "message", message: { role: "assistant", usage: { input: 1, output: 1, cacheRead: 1, cost: { total: 0.02 } } } }),
+		JSON.stringify({ type: "message", message: { role: "user" } }), // sin usage → ignorado
+		"línea no-json", // ignorada
+	].join("\n");
+	const u = usageFromSessionJsonl(jsonl);
+	assert.equal(u.input, 112);
+	assert.equal(u.output, 23);
+	assert.equal(u.cacheRead, 9);
+	assert.ok(Math.abs(u.costUsd - 0.03) < 1e-9, `costUsd ${u.costUsd}`);
+	// sin ningún cost.total → SIN costUsd (no 0 mintiendo)
+	const sinCost = usageFromSessionJsonl(
+		JSON.stringify({ type: "message", message: { role: "assistant", usage: { input: 5, output: 5, cacheRead: 5 } } }),
+	);
+	assert.deepEqual(sinCost, { input: 5, output: 5, cacheRead: 5 });
+});
+
+await test("usageFromSessionJsonl vacío / sin usage → ceros sin costUsd (fallback en runTask)", async () => {
+	assert.deepEqual(usageFromSessionJsonl(""), { input: 0, output: 0, cacheRead: 0 });
+	assert.deepEqual(usageFromSessionJsonl("basura\n\n{nope}"), { input: 0, output: 0, cacheRead: 0 });
+	// default readSessionUsage (walk real, sin jsonl) → undefined → fallback chars
+	const fake = makeFakeSpawn();
+	const rt = createSubagentsRuntime({ spawnFn: fake.spawnFn, mkdirSessionDir: () => {}, rmSessionDir: () => {} });
+	const batch = rt.runBatch([{ id: "t1", prompt: "x" }]);
+	await tick();
+	fake.finishProc(fake.procs[0], 0, null, "hola");
+	const [r] = await batch;
+	assert.deepEqual(r.usage, { input: 0, output: 0, cacheRead: 0, chars: 4 }); // "hola".length
+});
+
+await test("sumUsage: [] → ceros; costUsd solo si ALGUNA part lo trae", () => {
+	assert.deepEqual(sumUsage([]), { input: 0, output: 0, cacheRead: 0 });
+	assert.deepEqual(
+		sumUsage([{ input: 1, output: 2, cacheRead: 3 }, { input: 10, output: 20, cacheRead: 30, costUsd: 0.5 }, { chars: 5 }]),
+		{ input: 11, output: 22, cacheRead: 33, costUsd: 0.5 },
+	);
+});
+
+await test("parseMaxCostUsd: ausente/''/NaN/negativo → undefined; '0.5' → 0.5", () => {
+	assert.equal(parseMaxCostUsd({}), undefined);
+	assert.equal(parseMaxCostUsd({ PI_SUBAGENTS_MAX_COST_USD: "" }), undefined);
+	assert.equal(parseMaxCostUsd({ PI_SUBAGENTS_MAX_COST_USD: "abc" }), undefined);
+	assert.equal(parseMaxCostUsd({ PI_SUBAGENTS_MAX_COST_USD: "-1" }), undefined);
+	assert.equal(parseMaxCostUsd({ PI_SUBAGENTS_MAX_COST_USD: "0.5" }), 0.5);
+	assert.equal(parseMaxCostUsd({ PI_SUBAGENTS_MAX_COST_USD: "0" }), 0);
+});
+
+await test("formatBatchSummary: costo, n/d, PAYG, skipped (formato congelado)", () => {
+	assert.equal(
+		formatBatchSummary({ n: 4, wallMs: 12345, sumMs: 30100, costUsd: 0.31, payg: false }),
+		"4 tasks · 12.3s wall · 30.1s cpu · ~$0.31 total",
+	);
+	assert.equal(
+		formatBatchSummary({ n: 3, wallMs: 8000, sumMs: 8000, payg: true }),
+		"3 tasks · 8.0s wall · 8.0s cpu · cost n/d · incluye PAYG",
+	);
+	assert.equal(
+		formatBatchSummary({ n: 4, wallMs: 1000, sumMs: 2000, costUsd: 0.5, payg: true, skipped: 1 }),
+		"4 tasks · 1.0s wall · 2.0s cpu · ~$0.50 total · incluye PAYG · 1 skipped (presupuesto)",
+	);
+});
+
+await test("runBatch: usage inyectado en cada result; execute foreground arma envelope con summary", async () => {
+	const fake = makeFakeSpawn();
+	const usage = { input: 100, output: 50, cacheRead: 10, costUsd: 0.01 };
+	const rt = createSubagentsRuntime({ spawnFn: fake.spawnFn, readSessionUsage: () => usage });
+	const { pi, tools } = makeFakePi();
+	installSubagents(pi, rt);
+	const updates = [];
+	const exec = tools.subagents.execute(
+		"tc",
+		{ tasks: [{ id: "t1", role: "research", prompt: "x" }] },
+		undefined,
+		(u) => updates.push(u.content[0].text),
+	);
+	await tick();
+	fake.finishProc(fake.procs[0], 0, null, "hola");
+	const out = await exec;
+	const env = JSON.parse(out.content[0].text);
+	assert.equal(env.results.length, 1);
+	assert.deepEqual(env.results[0].usage, usage);
+	assert.match(env.summary, /^1 tasks · [\d.]+s wall · [\d.]+s cpu · ~\$0\.01 total$/);
+	assert.equal(env.payg, false);
+	assert.equal(out.details.summary, env.summary);
+	assert.match(updates[0], /t1\/1 done · exit 0 · [\d.]+s · \$0\.01 · alibaba\/qwen3\.8-max/);
+});
+
+await test("presupuesto foreground: acumulado >= max → el próximo NO spawnea (exit 125, skipped budget)", async () => {
+	const fake = makeFakeSpawn();
+	const rt = createSubagentsRuntime({
+		spawnFn: fake.spawnFn,
+		concurrency: 1,
+		env: { PI_SUBAGENTS_MAX_COST_USD: "0.01" },
+		readSessionUsage: () => ({ input: 100, output: 10, cacheRead: 0, costUsd: 0.02 }),
+	});
+	const batch = rt.runBatch([{ id: "t1", prompt: "caro" }, { id: "t2", prompt: "barato" }]);
+	await tick(); // t1 spawnea (única vía de cost)
+	fake.finishProc(fake.procs[0], 0);
+	const results = await batch;
+	assert.equal(fake.argss.length, 1, "solo t1 spawnó");
+	assert.equal(results[0].usage.costUsd, 0.02);
+	assert.equal(results[1].skipped, "budget");
+	assert.equal(results[1].exitCode, 125);
+	assert.equal(results[1].durationMs, 0);
+	assert.match(results[1].output, /PI_SUBAGENTS_MAX_COST_USD/);
+	assert.match(results[1].output, /\$0\.02 >= \$0\.01/);
+	assert.deepEqual(results[1].usage, { input: 0, output: 0, cacheRead: 0 });
+});
+
+await test("presupuesto no pisa vivos: concurrency=2, ambos spawned → 0 skipped", async () => {
+	const fake = makeFakeSpawn();
+	const rt = createSubagentsRuntime({
+		spawnFn: fake.spawnFn,
+		concurrency: 2,
+		env: { PI_SUBAGENTS_MAX_COST_USD: "0.01" },
+		readSessionUsage: () => ({ input: 1, output: 1, cacheRead: 0, costUsd: 0.02 }),
+	});
+	const batch = rt.runBatch([{ id: "a", prompt: "1" }, { id: "b", prompt: "2" }]);
+	await tick(); // ambos spawned ANTES de que llegue cualquier usage
+	fake.finishProc(fake.procs[0], 0);
+	fake.finishProc(fake.procs[1], 0);
+	const results = await batch;
+	assert.equal(fake.argss.length, 2);
+	assert.ok(results.every((r) => r.skipped === undefined), "ninguno skipped");
+});
+
+await test("presupuesto background: skipped → onComplete SÍ + state 'skipped' + totals", async () => {
+	const fake = makeFakeSpawn();
+	const rt = createSubagentsRuntime({
+		spawnFn: fake.spawnFn,
+		concurrency: 1,
+		env: { PI_SUBAGENTS_MAX_COST_USD: "0.01" },
+		readSessionUsage: () => ({ input: 1, output: 1, cacheRead: 0, costUsd: 0.02 }),
+	});
+	const calls = [];
+	const done = new Promise((resolve) => {
+		let n = 0;
+		rt.dispatchBackground([{ id: "a", prompt: "1" }, { id: "b", prompt: "2" }], {
+			onComplete: (r) => {
+				calls.push(r);
+				if (++n === 2) resolve();
+			},
+		});
+	});
+	await tick();
+	fake.finishProc(fake.procs[0], 0);
+	await done;
+	assert.equal(fake.argss.length, 1, "solo 'a' spawnó");
+	const b = calls.find((r) => r.id === "b");
+	assert.equal(b.skipped, "budget");
+	assert.equal(b.exitCode, 125);
+	const s = rt.status();
+	assert.equal(s.running.length, 0);
+	assert.equal(s.completed.find((c) => c.id === "b").state, "skipped");
+	assert.ok(Math.abs(s.totals.costUsd - 0.02) < 1e-9, `totals.costUsd ${s.totals.costUsd}`);
+	assert.ok(s.totals.sumMs >= 0);
+	assert.equal(s.totals.payg, undefined);
+});
+
+await test("role hard → payg true: envelope + summary + note background + totals", async () => {
+	const fake = makeFakeSpawn();
+	const rt = createSubagentsRuntime({ spawnFn: fake.spawnFn, readSessionUsage: () => undefined });
+	const { pi, tools } = makeFakePi();
+	installSubagents(pi, rt);
+	const exec = tools.subagents.execute("tc1", { tasks: [{ id: "h1", role: "hard", prompt: "x" }] }, undefined, undefined);
+	await tick();
+	fake.finishProc(fake.procs[0], 0, null, "ok");
+	const out = await exec;
+	const env = JSON.parse(out.content[0].text);
+	assert.equal(env.payg, true);
+	assert.match(env.summary, / · incluye PAYG$/);
+	assert.equal(env.results[0].usage.chars, 2); // "ok".length — fallback sin costUsd
+	assert.equal("costUsd" in env.results[0].usage, false);
+
+	const bg = await tools.subagents.execute("tc2", { background: true, tasks: [{ id: "h2", role: "hard", prompt: "y" }] }, undefined, undefined);
+	assert.match(JSON.parse(bg.content[0].text).note, /incluye PAYG/);
+	fake.finishProc(fake.procs[1], 0);
+	await tick();
+	assert.equal(rt.status().totals.payg, true);
+});
+
+await test("rmSessionDir se llama aunque el child salga ≠ 0", async () => {
+	const rms = [];
+	const fake = makeFakeSpawn();
+	const rt = createSubagentsRuntime({ spawnFn: fake.spawnFn, mkdirSessionDir: () => {}, rmSessionDir: (d) => rms.push(d) });
+	const batch = rt.runBatch([{ id: "bad", prompt: "x" }]);
+	await tick();
+	fake.finishProc(fake.procs[0], 3); // exit ≠ 0
+	const [r] = await batch;
+	assert.equal(r.exitCode, 3);
+	assert.ok(rms.some((d) => /[\\/]bad$/.test(d)), `task dir en ${JSON.stringify(rms)}`);
+	assert.ok(rms.length >= 1);
+});
+
+await test("formatSubagentResult incluye ~$X o cost n/d (nunca nada más)", () => {
+	assert.match(
+		formatSubagentResult({ id: "t1", role: "grunt", model: "alibaba/qwen3.8-max", exitCode: 0, durationMs: 100, output: "x", usage: { input: 0, output: 0, cacheRead: 0, chars: 1 } }),
+		/^\[subagent t1 · grunt · alibaba\/qwen3\.8-max · 0\.1s · exit 0 · cost n\/d\]/,
+	);
+	assert.match(
+		formatSubagentResult({ id: "t2", role: "hard", model: "deepseek-payg/deepseek/deepseek-v4-pro", exitCode: 125, durationMs: 0, output: "skip", usage: { input: 0, output: 0, cacheRead: 0 }, skipped: "budget" }),
+		/^\[subagent t2 · hard · deepseek-payg\/deepseek\/deepseek-v4-pro · 0\.0s · exit 125 · cost n\/d\]/,
+	);
+});
+
 // ---------- E2E (opt-in) ----------
 if (process.env.SUBAGENTS_E2E === "1") {
 	await test("E2E: 3 tasks grunt paralelos, exit 0, wall ≈ max no suma", async () => {
@@ -622,6 +845,45 @@ if (process.env.SUBAGENTS_E2E === "1") {
 } else {
 	console.log("skip E2E (SUBAGENTS_E2E != 1)");
 }
+
+await test("id con path traversal se rechaza antes de spawn", async () => {
+	const fake = makeFakeSpawn();
+	const rt = createSubagentsRuntime({ spawnFn: fake.spawnFn });
+	await assert.rejects(
+		() => rt.runBatch([{ id: "../../etc", prompt: "x" }]),
+		/id ".*" inválido/,
+	);
+	await assert.rejects(
+		() => rt.runBatch([{ id: "a/b", prompt: "x" }]),
+		/inválido/,
+	);
+	assert.equal(fake.argss.length, 0);
+});
+
+await test("PI_SUBAGENTS_MAX_COST_USD se relee por batch (no al crear el runtime)", async () => {
+	const fake = makeFakeSpawn();
+	const env = {};
+	const rt = createSubagentsRuntime({
+		spawnFn: fake.spawnFn,
+		concurrency: 1,
+		env,
+		readSessionUsage: () => ({ input: 1, output: 1, cacheRead: 0, costUsd: 0.02 }),
+	});
+	const first = rt.runBatch([{ id: "a1", prompt: "1" }, { id: "a2", prompt: "2" }]);
+	await tick();
+	fake.finishProc(fake.procs[0], 0);
+	await tick();
+	fake.finishProc(fake.procs[1], 0);
+	const r1 = await first;
+	assert.equal(r1.filter((x) => x.skipped).length, 0, "sin tope: los 2 corren");
+	env.PI_SUBAGENTS_MAX_COST_USD = "0.01";
+	const second = rt.runBatch([{ id: "b1", prompt: "1" }, { id: "b2", prompt: "2" }]);
+	await tick();
+	fake.finishProc(fake.procs[2], 0);
+	const r2 = await second;
+	assert.equal(fake.argss.length, 3, "con tope solo spawnó b1 (a1+a2+b1)");
+	assert.equal(r2[1].skipped, "budget");
+});
 
 console.log(`\n${passed} passed, ${failures.length} failed`);
 if (failures.length > 0) {
