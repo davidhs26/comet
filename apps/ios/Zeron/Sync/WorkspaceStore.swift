@@ -367,7 +367,9 @@ final class WorkspaceStore {
     /// dotfiles, stamps isRepo). nil path = the device's home directory.
     func listFolders(deviceId: String, path: String?) async -> FolderListing? {
         do {
-            return try await listFoldersDetailed(deviceId: deviceId, path: path)
+            let listing = try await listFoldersDetailed(deviceId: deviceId, path: path)
+            lastRelayError = nil
+            return listing
         } catch {
             lastRelayError = error.localizedDescription
             return nil
