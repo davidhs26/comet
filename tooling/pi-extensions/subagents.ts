@@ -66,6 +66,39 @@ export function modelKey(route: Route): string {
 }
 
 /**
+ * Piso de timeout por rol (directiva David 2026-08-18): el orquestador LLM no
+ * puede elegir un timeout menor al piso — reviews @ high e implementaciones
+ * reales tardan minutos y matarlas a los 5 min producía "subagentes mudos"
+ * (exit 124 con output vacío: en modo -p el output se emite recién al final).
+ */
+export const ROLE_TIMEOUT_FLOOR_MS: Record<Role, number> = {
+	implement: 900_000,
+	hard: 900_000,
+	review: 600_000,
+	research: 300_000,
+	grunt: 300_000,
+};
+
+/**
+ * Timeout efectivo de un task: max(pedido, piso del rol). Sin pedido → default.
+ */
+export function effectiveTimeoutMs(
+	role: Role,
+	requested: number | undefined,
+	floors: Partial<Record<Role, number>> = ROLE_TIMEOUT_FLOOR_MS,
+): number {
+	const floor = floors[role] ?? 0;
+	return Math.max(requested ?? DEFAULT_TIMEOUT_MS, floor);
+}
+
+/**
+ * Heartbeat de progreso hacia el padre (directiva David 2026-08-18: el usuario
+ * debe ver en qué se trabaja cada ≤25s). Además mantiene vivo el stream ACP:
+ * el engine Zeron parkea turnos tras ~30s de silencio (settle window).
+ */
+export const HEARTBEAT_INTERVAL_MS = 20_000;
+
+/**
  * Resuelve provider/model/thinking para un task. `modelOverride` se splitea en
  * el PRIMER "/" → provider/model (el model puede contener slashes, p.ej.
  * "deepseek-payg/deepseek/deepseek-v4-pro"). Role default: grunt.
@@ -385,6 +418,10 @@ export interface RuntimeDeps {
 	rmSessionDir?: (dir: string) => void;
 	/** Crea el dir de sesión antes del spawn. */
 	mkdirSessionDir?: (dir: string) => void;
+	/** Pisos de timeout por rol; {} deshabilita el clamp (tests). */
+	timeoutFloorsMs?: Partial<Record<Role, number>>;
+	/** Intervalo del heartbeat de progreso; 0 lo deshabilita. */
+	heartbeatMs?: number;
 }
 
 interface ResolvedTask {
@@ -405,6 +442,8 @@ const defaultPiBin = (): string => path.join(os.homedir(), ".npm-global", "bin",
 export function createSubagentsRuntime(deps: RuntimeDeps = {}) {
 	const spawnFn: SpawnFn = deps.spawnFn ?? spawn;
 	const now: () => number = deps.now ?? Date.now;
+	const timeoutFloorsMs: Partial<Record<Role, number>> = deps.timeoutFloorsMs ?? ROLE_TIMEOUT_FLOOR_MS;
+	const heartbeatMs: number = deps.heartbeatMs ?? HEARTBEAT_INTERVAL_MS;
 	const concurrency: number = deps.concurrency ?? MAX_CONCURRENCY;
 	const killGraceMs: number = deps.killGraceMs ?? KILL_GRACE_MS;
 	const piBin: string = deps.piBin ?? defaultPiBin();
@@ -573,7 +612,7 @@ export function createSubagentsRuntime(deps: RuntimeDeps = {}) {
 					}
 				}, killGraceMs);
 				pendingKills.add(killTimer);
-			}, task.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+			}, effectiveTimeoutMs(task.role, task.timeoutMs, timeoutFloorsMs));
 			child.stdout?.on("data", (d: Buffer) => {
 				stdout = trimTail(stdout + d.toString("utf8"));
 			});
@@ -582,7 +621,15 @@ export function createSubagentsRuntime(deps: RuntimeDeps = {}) {
 			});
 			child.on("error", (err: Error) => finish(-1, `spawn error: ${err.message}`));
 			child.on("exit", (code: number | null) => {
-				finish(timedOut ? TIMEOUT_EXIT_CODE : (code ?? -1));
+				if (timedOut) {
+					const secs = Math.round(effectiveTimeoutMs(task.role, task.timeoutMs, timeoutFloorsMs) / 1000);
+					finish(
+						TIMEOUT_EXIT_CODE,
+						`subagents: timeout tras ${secs}s — en modo -p el output se emite recién al final; la task probablemente seguía trabajando. Reintentá con timeoutMs mayor o partí la task en pasos más chicos.`,
+					);
+				} else {
+					finish(code ?? -1);
+				}
 			});
 		});
 	}
@@ -611,6 +658,31 @@ export function createSubagentsRuntime(deps: RuntimeDeps = {}) {
 		}
 		const results: Array<SubagentResult | undefined> = new Array(resolved.length);
 		const queue = resolved.map((task, index) => ({ task, index }));
+		// Heartbeat (directiva 2026-08-18): tasks vivas + elapsed cada ≤25s.
+		// Mantiene vivo el stream ACP (el engine parkea a los ~30s de silencio)
+		// y le muestra al usuario en qué se está trabajando.
+		const inFlight = new Map<string, { role: Role; model: string; startedAt: number }>();
+		// Hallazgo k3 (review 2026-08-18): onUpdate puede lanzar si el host está en
+		// teardown — nunca debe tumbar el batch ni el interval.
+		const emitUpdate = (text: string): void => {
+			try {
+				opts?.onUpdate?.({ content: [{ type: "text", text }] });
+			} catch {
+				/* host en teardown */
+			}
+		};
+		let heartbeat: ReturnType<typeof setInterval> | undefined;
+		if (opts?.onUpdate && heartbeatMs > 0) {
+			heartbeat = setInterval(() => {
+				if (inFlight.size === 0) return;
+				const live = [...inFlight.entries()]
+					.map(([id, e]) => `${id} (${e.role}·${e.model}) ${Math.round((now() - e.startedAt) / 1000)}s`)
+					.join(" · ");
+				const done = results.filter((r) => r !== undefined).length;
+				emitUpdate(`subagents: ⏳ ${live} — ${done}/${resolved.length} done, ${queue.length} en cola`);
+			}, heartbeatMs);
+			heartbeat.unref?.();
+		}
 		const worker = async (): Promise<void> => {
 			while (queue.length > 0 && !aborted) {
 				if (killEpoch !== myEpoch) {
@@ -624,18 +696,29 @@ export function createSubagentsRuntime(deps: RuntimeDeps = {}) {
 				if (maxCostUsd !== undefined && accumulatedCost >= maxCostUsd) {
 					const r = budgetSkipResult(next.task, maxCostUsd, accumulatedCost);
 					results[next.index] = r;
-					opts?.onUpdate?.({ content: [{ type: "text", text: progressLine(r, resolved.length) }] });
+					emitUpdate(progressLine(r, resolved.length));
 					continue;
 				}
-				const r = await runTask(next.task, batchKey);
+				inFlight.set(next.task.id, {
+					role: next.task.role,
+					model: modelKey(next.task.route),
+					startedAt: now(),
+				});
+				let r: SubagentResult;
+				try {
+					r = await runTask(next.task, batchKey);
+				} finally {
+					inFlight.delete(next.task.id);
+				}
 				if (typeof r.usage?.costUsd === "number") accumulatedCost += r.usage.costUsd;
 				results[next.index] = r;
-				opts?.onUpdate?.({ content: [{ type: "text", text: progressLine(r, resolved.length) }] });
+				emitUpdate(progressLine(r, resolved.length));
 			}
 		};
 		try {
 			await Promise.all(Array.from({ length: Math.min(concurrency, resolved.length) }, worker));
 		} finally {
+			if (heartbeat) clearInterval(heartbeat);
 			opts?.signal?.removeEventListener("abort", onAbort);
 			cleanupBatchDir(batchKey);
 		}
