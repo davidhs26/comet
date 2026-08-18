@@ -92,6 +92,10 @@ const REGISTRY_PROBE_QUIET: std::time::Duration = std::time::Duration::from_secs
 /// Deaf-socket escalation: live peer presence dark this long after the
 /// tripwire probe → redial on a fresh socket (see `check_presence_deafness`).
 const PRESENCE_DEAF_REDIAL_MS: i64 = 60_000;
+/// Cap on the doubling interval between REPEAT redials while presence stays
+/// dark — bounds the cost of a genuinely-offline fleet to roughly the
+/// registry probe cadence (one dial per 15 min).
+const PRESENCE_DEAF_REDIAL_CAP_MS: i64 = 900_000;
 
 /// State for the presence deafness tripwire. Presence heartbeats ride the
 /// SAME socket and the same DO broadcast fan-out as row updates, so "peers I
@@ -110,6 +114,76 @@ struct PresenceWatch {
     dark_since_ms: i64,
     /// The cheap first response (probe) already fired.
     probed: bool,
+    /// Redials fired during this dark spell (drives the escalation backoff).
+    redials: u32,
+    /// Epoch ms of the last redial escalation (0 = none this spell).
+    last_redial_ms: i64,
+}
+
+/// What the presence tripwire decided on a tick — the side effects (logging,
+/// probe/redial, the deaf-escalation hook) live in the caller so this state
+/// machine stays pure and unit-testable.
+#[derive(Debug, PartialEq, Eq)]
+enum DeafAction {
+    None,
+    /// Presence came back after at least one redial escalation.
+    Recovered { redials: u32, dark_ms: i64 },
+    /// First all-dark observation: fire the cheap deadline-checked probe.
+    Probe,
+    /// Still dark past the current backoff step: fresh-socket redial (and the
+    /// caller sweeps the open chat rooms via the deaf-escalation hook).
+    Redial { attempt: u32, dark_ms: i64 },
+}
+
+impl PresenceWatch {
+    /// Pure state step for `check_presence_deafness` — see [`DeafAction`].
+    /// While presence stays dark, redials repeat with a doubling interval
+    /// (base [`PRESENCE_DEAF_REDIAL_MS`], cap [`PRESENCE_DEAF_REDIAL_CAP_MS`]).
+    fn tick(&mut self, live_fresh_peers: usize, now: i64) -> DeafAction {
+        if live_fresh_peers > 0 {
+            let action = if self.redials > 0 {
+                DeafAction::Recovered {
+                    redials: self.redials,
+                    dark_ms: now.saturating_sub(self.dark_since_ms),
+                }
+            } else {
+                DeafAction::None
+            };
+            self.armed = true;
+            self.dark_since_ms = 0;
+            self.probed = false;
+            self.redials = 0;
+            self.last_redial_ms = 0;
+            return action;
+        }
+        if !self.armed {
+            return DeafAction::None;
+        }
+        if self.dark_since_ms == 0 {
+            self.dark_since_ms = now;
+        }
+        if !self.probed {
+            self.probed = true;
+            return DeafAction::Probe;
+        }
+        let reference = if self.redials == 0 {
+            self.dark_since_ms
+        } else {
+            self.last_redial_ms
+        };
+        let backoff = PRESENCE_DEAF_REDIAL_MS
+            .saturating_mul(1_i64 << self.redials.min(24))
+            .min(PRESENCE_DEAF_REDIAL_CAP_MS);
+        if now.saturating_sub(reference) <= backoff {
+            return DeafAction::None;
+        }
+        self.redials = self.redials.saturating_add(1);
+        self.last_redial_ms = now;
+        DeafAction::Redial {
+            attempt: self.redials,
+            dark_ms: now.saturating_sub(self.dark_since_ms),
+        }
+    }
 }
 
 /// Cheap decorrelation jitter (0–500ms) without pulling in a rng — derived from
@@ -162,10 +236,18 @@ struct WorkspaceHostInner {
     peer_alive: Mutex<Option<PeerAliveHook>>,
     /// Deaf-socket tripwire state — see `check_presence_deafness`.
     presence_watch: Mutex<PresenceWatch>,
+    /// Called on every deaf-socket redial escalation — wired to
+    /// `DocHost::probe_open_chats` so a dark registry room also
+    /// liveness-checks every open chat room (they ride the same relay, and a
+    /// deaf chat room silently drops transcript delivery to remote devices).
+    deaf_escalation: Mutex<Option<DeafEscalationHook>>,
 }
 
 /// "This peer is alive" callback (device id) — see `WorkspaceHost::set_peer_alive_hook`.
 pub type PeerAliveHook = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// Deaf-socket escalation callback — see `WorkspaceHost::set_deaf_escalation_hook`.
+pub type DeafEscalationHook = Arc<dyn Fn() + Send + Sync>;
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
@@ -275,6 +357,7 @@ impl WorkspaceHost {
                 presence_seen: Mutex::new(std::collections::HashMap::new()),
                 peer_alive: Mutex::new(None),
                 presence_watch: Mutex::new(PresenceWatch::default()),
+                deaf_escalation: Mutex::new(None),
             }),
         };
         // Persist immediately: after this boot the migration source is never
@@ -422,6 +505,15 @@ impl WorkspaceHost {
     /// the engine points this at `LinkCache::reset_cooldown`.
     pub fn set_peer_alive_hook(&self, hook: PeerAliveHook) {
         *lock(&self.inner.peer_alive) = Some(hook);
+    }
+
+    /// Wire the deaf-socket escalation to a callback — the engine points this
+    /// at `DocHost::probe_open_chats`. Chat rooms ride the same relay as the
+    /// registry room, so when the registry socket is judged deaf the chat
+    /// sockets are suspect too; a probe is free on a healthy room and a room
+    /// that misses its probe deadline redials itself.
+    pub fn set_deaf_escalation_hook(&self, hook: DeafEscalationHook) {
+        *lock(&self.inner.deaf_escalation) = Some(hook);
     }
 
     pub fn device_id(&self) -> &str {
@@ -949,7 +1041,15 @@ impl WorkspaceHostInner {
     }
 
     fn publish(&self) {
-        match lock(&self.reg).read_all() {
+        // Bind the read OUTSIDE the match: a `match lock(&self.reg).read_all()`
+        // scrutinee keeps the registry guard alive through every arm, and
+        // `overlay_presence` fans out into presence hooks (peer-alive,
+        // deaf-escalation) that reach DocHost — whose own paths take `handles`
+        // before `reg` (`open`, eviction → `pinned` → `is_host`). Holding
+        // `reg` across the overlay is an AB-BA deadlock waiting for a
+        // dark-presence spell.
+        let state = lock(&self.reg).read_all();
+        match state {
             Ok(mut state) => {
                 self.overlay_presence(&mut state.devices);
                 // send_replace, NOT send: `watch::Sender::send` drops the value when
@@ -974,6 +1074,7 @@ impl WorkspaceHostInner {
     /// (dial-cooldown reset).
     fn overlay_presence(&self, devices: &mut [Device]) {
         let mut alive_peers: Vec<String> = Vec::new();
+        let mut deaf_escalated = false;
         {
             // No live room handle is NOT "everyone is offline": the cache (fed
             // by past heartbeats and the relay-status probe) still overlays —
@@ -1015,7 +1116,16 @@ impl WorkspaceHostInner {
                 }
             }
             if let Some(room) = room.as_ref() {
-                self.check_presence_deafness(room, live_fresh_peers, now);
+                deaf_escalated = self.check_presence_deafness(room, live_fresh_peers, now);
+            }
+        }
+        // Hooks fire OUTSIDE the room/presence_seen guards (and publish() has
+        // already released `reg`): both fan out into other subsystems
+        // (LinkCache, DocHost) whose lock orders must not nest under ours.
+        if deaf_escalated {
+            let hook = lock(&self.deaf_escalation).clone();
+            if let Some(hook) = hook {
+                hook();
             }
         }
         if alive_peers.is_empty() {
@@ -1034,38 +1144,51 @@ impl WorkspaceHostInner {
     /// ladder: first all-dark observation → deadline-checked probe (free on a
     /// healthy room); still dark [`PRESENCE_DEAF_REDIAL_MS`] later → fresh-
     /// socket redial (the only cure when the server→client path drops even
-    /// probe answers). Disarms after the redial and re-arms when a peer is
-    /// next seen live, so a genuinely-offline fleet costs one probe + one
-    /// redial, ever.
-    fn check_presence_deafness(&self, room: &RegistryClient, live_fresh_peers: usize, now: i64) {
-        let mut watch = lock(&self.presence_watch);
-        if live_fresh_peers > 0 {
-            watch.armed = true;
-            watch.dark_since_ms = 0;
-            watch.probed = false;
-            return;
-        }
-        if !watch.armed {
-            return;
-        }
-        if watch.dark_since_ms == 0 {
-            watch.dark_since_ms = now;
-        }
-        if !watch.probed {
-            tracing::info!(
-                "all live peer presence went dark; probing registry room (deaf-socket tripwire)"
-            );
-            room.probe();
-            watch.probed = true;
-        } else if now.saturating_sub(watch.dark_since_ms) > PRESENCE_DEAF_REDIAL_MS {
-            tracing::warn!(
-                dark_ms = now.saturating_sub(watch.dark_since_ms),
-                "peer presence still dark after probe; requesting registry room redial"
-            );
-            room.redial();
-            watch.armed = false;
-            watch.dark_since_ms = 0;
-            watch.probed = false;
+    /// probe answers) PLUS the deaf-escalation hook (probe every open chat
+    /// room — they ride the same relay and go deaf together; 2026-08-18
+    /// incident: a completed turn's final message sat undelivered in a deaf
+    /// chat room while only the registry was redialed). While presence stays
+    /// dark the redial repeats with a doubling interval capped at
+    /// [`PRESENCE_DEAF_REDIAL_CAP_MS`] — the earlier one-shot version went
+    /// silent forever when its single redial landed on another dead socket.
+    /// A genuinely-offline fleet costs one dial per backoff step, bounded at
+    /// the cap (≈ the registry probe cadence); a live peer resets everything.
+    /// Returns `true` when this tick fired a redial escalation — the CALLER
+    /// invokes the deaf-escalation hook after releasing its guards (the hook
+    /// reaches DocHost, whose lock order must not nest under room/reg).
+    fn check_presence_deafness(
+        &self,
+        room: &RegistryClient,
+        live_fresh_peers: usize,
+        now: i64,
+    ) -> bool {
+        let action = lock(&self.presence_watch).tick(live_fresh_peers, now);
+        match action {
+            DeafAction::None => false,
+            DeafAction::Recovered { redials, dark_ms } => {
+                tracing::info!(
+                    redials,
+                    dark_ms,
+                    "peer presence recovered after deaf-socket escalation"
+                );
+                false
+            }
+            DeafAction::Probe => {
+                tracing::info!(
+                    "all live peer presence went dark; probing registry room (deaf-socket tripwire)"
+                );
+                room.probe();
+                false
+            }
+            DeafAction::Redial { attempt, dark_ms } => {
+                tracing::warn!(
+                    dark_ms,
+                    attempt,
+                    "peer presence still dark; redialing registry room and probing open chat rooms"
+                );
+                room.redial();
+                true
+            }
         }
     }
 
@@ -1271,7 +1394,10 @@ fn device_name_on_boot(existing_name: Option<&str>, detected_name: &str) -> Stri
 
 #[cfg(test)]
 mod tests {
-    use super::{device_name_on_boot, linked_worktree_root};
+    use super::{
+        DeafAction, PresenceWatch, PRESENCE_DEAF_REDIAL_CAP_MS, PRESENCE_DEAF_REDIAL_MS,
+        device_name_on_boot, linked_worktree_root,
+    };
 
     #[test]
     fn boot_repairs_the_legacy_unknown_device_sentinel() {
@@ -1326,5 +1452,80 @@ mod tests {
         std::fs::create_dir_all(&odd).unwrap();
         std::fs::write(odd.join(".git"), "gitdir: /somewhere/else\n").unwrap();
         assert_eq!(linked_worktree_root(&odd), None);
+    }
+
+    #[test]
+    fn deaf_tripwire_stays_disarmed_until_a_peer_is_seen() {
+        let mut w = PresenceWatch::default();
+        assert_eq!(w.tick(0, 1_000), DeafAction::None);
+        assert_eq!(w.tick(0, 999_000), DeafAction::None);
+    }
+
+    #[test]
+    fn deaf_tripwire_escalates_probe_then_redials_with_doubling_backoff() {
+        let mut w = PresenceWatch::default();
+        assert_eq!(w.tick(1, 0), DeafAction::None); // arm
+        let t0 = 100_000i64;
+        assert_eq!(w.tick(0, t0), DeafAction::Probe);
+        // Not yet past the 60s base interval.
+        assert_eq!(w.tick(0, t0 + PRESENCE_DEAF_REDIAL_MS), DeafAction::None);
+        // First redial 60s+ after going dark (same threshold as the old
+        // one-shot version).
+        let t1 = t0 + PRESENCE_DEAF_REDIAL_MS + 1;
+        assert_eq!(
+            w.tick(0, t1),
+            DeafAction::Redial {
+                attempt: 1,
+                dark_ms: t1 - t0
+            }
+        );
+        // Second redial waits the DOUBLED interval measured from the first.
+        assert_eq!(w.tick(0, t1 + 2 * PRESENCE_DEAF_REDIAL_MS), DeafAction::None);
+        let t2 = t1 + 2 * PRESENCE_DEAF_REDIAL_MS + 1;
+        assert_eq!(
+            w.tick(0, t2),
+            DeafAction::Redial {
+                attempt: 2,
+                dark_ms: t2 - t0
+            }
+        );
+        // Deep into the spell the interval clamps at the cap, never overflows.
+        w.redials = 20;
+        w.last_redial_ms = t2;
+        assert_eq!(
+            w.tick(0, t2 + PRESENCE_DEAF_REDIAL_CAP_MS),
+            DeafAction::None
+        );
+        let t3 = t2 + PRESENCE_DEAF_REDIAL_CAP_MS + 1;
+        assert_eq!(
+            w.tick(0, t3),
+            DeafAction::Redial {
+                attempt: 21,
+                dark_ms: t3 - t0
+            }
+        );
+    }
+
+    #[test]
+    fn deaf_tripwire_rearms_and_reports_recovery() {
+        let mut w = PresenceWatch::default();
+        assert_eq!(w.tick(1, 0), DeafAction::None);
+        assert_eq!(w.tick(0, 100_000), DeafAction::Probe);
+        assert!(matches!(
+            w.tick(0, 200_000),
+            DeafAction::Redial { attempt: 1, .. }
+        ));
+        // A live peer resets the spell and reports how long it lasted.
+        assert_eq!(
+            w.tick(2, 250_000),
+            DeafAction::Recovered {
+                redials: 1,
+                dark_ms: 150_000
+            }
+        );
+        // Still armed: the next dark spell starts from the probe again.
+        assert_eq!(w.tick(0, 300_000), DeafAction::Probe);
+        // Recovery with zero redials (probe was enough) stays quiet.
+        assert_eq!(w.tick(1, 310_000), DeafAction::None);
     }
 }
