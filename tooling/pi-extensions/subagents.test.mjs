@@ -14,7 +14,7 @@ delete process.env.PI_SUBAGENT_DEPTH;
 
 const here = import.meta.dirname;
 const mod = await import(url.pathToFileURL(path.join(here, "subagents.ts")).href);
-const { resolveRoute, canSpawn, assertReviewerDistinct, trimTail, createSubagentsRuntime, ROUTES, modelKey, chooseDeliverAs, formatSubagentResult, installSubagents, sumUsage, usageFromSessionJsonl, parseMaxCostUsd, formatBatchSummary } = mod;
+const { resolveRoute, canSpawn, assertReviewerDistinct, trimTail, createSubagentsRuntime, ROUTES, modelKey, chooseDeliverAs, formatSubagentResult, installSubagents, sumUsage, usageFromSessionJsonl, parseMaxCostUsd, formatBatchSummary, effectiveTimeoutMs, ROLE_TIMEOUT_FLOOR_MS } = mod;
 
 let passed = 0;
 const failures = [];
@@ -212,7 +212,8 @@ await test("spawn args: PI absoluto + --session-dir (no --no-session) + env hijo
 // ---------- timeout ----------
 await test("timeout: TERM ignorado → KILL → exitCode ≠ 0 y el batch sigue", async () => {
 	const fake = makeFakeSpawn({ hangOnTerm: true });
-	const rt = createSubagentsRuntime({ spawnFn: fake.spawnFn, killGraceMs: 20 });
+	// timeoutFloorsMs: {} deshabilita el clamp por rol para poder testear con ms.
+	const rt = createSubagentsRuntime({ spawnFn: fake.spawnFn, killGraceMs: 20, timeoutFloorsMs: {} });
 	const batch = rt.runBatch([
 		{ id: "slow", prompt: "colgado", timeoutMs: 25 },
 		{ id: "fast", prompt: "rápido" },
@@ -224,7 +225,58 @@ await test("timeout: TERM ignorado → KILL → exitCode ≠ 0 y el batch sigue"
 	const slow = results.find((r) => r.id === "slow");
 	assert.equal(slow.exitCode, 124); // ≠ 0
 	assert.ok(slow.durationMs >= 25);
+	assert.ok(slow.output.includes("timeout tras"), "mensaje honesto de timeout");
+	assert.ok(slow.output.includes("-p"), "explica que el output de -p llega al final");
 	assert.equal(results.find((r) => r.id === "fast").exitCode, 0, "un fallo no tumba el batch");
+});
+
+// ---------- pisos de timeout por rol (directiva 2026-08-18) ----------
+await test("effectiveTimeoutMs: clamp al piso del rol; sin pedido usa default", () => {
+	assert.equal(effectiveTimeoutMs("review", 300_000), 600_000, "review no puede bajar de 10 min");
+	assert.equal(effectiveTimeoutMs("implement", 300_000), 900_000, "implement no puede bajar de 15 min");
+	assert.equal(effectiveTimeoutMs("grunt", 60_000), 300_000, "grunt no puede bajar de 5 min");
+	assert.equal(effectiveTimeoutMs("review", 1_200_000), 1_200_000, "subir sí se puede");
+	assert.equal(effectiveTimeoutMs("grunt", undefined), 900_000, "sin pedido → default 15 min");
+	assert.equal(effectiveTimeoutMs("review", 25, {}), 25, "floors {} deshabilita el clamp (tests)");
+	assert.equal(ROLE_TIMEOUT_FLOOR_MS.hard, 900_000);
+});
+
+// ---------- heartbeat (directiva 2026-08-18: reporte ≤25s) ----------
+await test("heartbeat: emite progreso con tasks vivas y elapsed mientras corren", async () => {
+	const fake = makeFakeSpawn();
+	const rt = createSubagentsRuntime({ spawnFn: fake.spawnFn, heartbeatMs: 10, timeoutFloorsMs: {} });
+	const updates = [];
+	const batch = rt.runBatch([{ id: "lento", role: "review", prompt: "review largo" }], {
+		onUpdate: (u) => updates.push(u.content[0].text),
+	});
+	await tick(40); // varios heartbeats con el hijo vivo
+	const beats = updates.filter((t) => t.includes("⏳"));
+	assert.ok(beats.length >= 1, `esperaba >=1 heartbeat, hubo ${beats.length}`);
+	assert.ok(beats[0].includes("lento"), "el heartbeat nombra la task");
+	assert.ok(beats[0].includes("review"), "el heartbeat trae el rol");
+	assert.ok(beats[0].includes("0/1 done"), "el heartbeat trae el progreso del batch");
+	fake.finishProc(fake.procs[0], 0);
+	const results = await batch;
+	assert.equal(results[0].exitCode, 0);
+	assert.ok(
+		updates.some((t) => t.includes("done") && !t.includes("⏳")),
+		"al completar sigue saliendo la línea done por task",
+	);
+});
+
+await test("heartbeat: no emite sin tasks vivas ni después de terminar el batch", async () => {
+	const fake = makeFakeSpawn();
+	const rt = createSubagentsRuntime({ spawnFn: fake.spawnFn, heartbeatMs: 10, timeoutFloorsMs: {} });
+	const updates = [];
+	const batch = rt.runBatch([{ id: "x", prompt: "rápido" }], {
+		onUpdate: (u) => updates.push(u.content[0].text),
+	});
+	await tick();
+	fake.finishProc(fake.procs[0], 0);
+	await batch;
+	const count = updates.length;
+	await tick(40); // el interval quedó cleareado en finally
+	assert.equal(updates.length, count, "sin heartbeats después del batch");
 });
 
 // ---------- spawn error ----------
