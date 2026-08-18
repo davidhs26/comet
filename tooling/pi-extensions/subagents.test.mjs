@@ -14,7 +14,7 @@ delete process.env.PI_SUBAGENT_DEPTH;
 
 const here = import.meta.dirname;
 const mod = await import(url.pathToFileURL(path.join(here, "subagents.ts")).href);
-const { resolveRoute, canSpawn, assertReviewerDistinct, trimTail, createSubagentsRuntime, ROUTES, modelKey, chooseDeliverAs, formatSubagentResult, installSubagents, sumUsage, usageFromSessionJsonl, parseMaxCostUsd, formatBatchSummary, effectiveTimeoutMs, ROLE_TIMEOUT_FLOOR_MS } = mod;
+const { resolveRoute, canSpawn, assertReviewerDistinct, trimTail, createSubagentsRuntime, ROUTES, modelKey, chooseDeliverAs, formatSubagentResult, installSubagents, sumUsage, usageFromSessionJsonl, parseMaxCostUsd, formatBatchSummary, effectiveTimeoutMs, ROLE_TIMEOUT_FLOOR_MS, resolveChildMode } = mod;
 
 let passed = 0;
 const failures = [];
@@ -29,8 +29,13 @@ async function test(name, fn) {
 	}
 }
 
-/** Fake de child_process.spawn: cuenta concurrencia, exit manual. */
-function makeFakeSpawn({ hangOnTerm = false } = {}) {
+/**
+ * Fake de child_process.spawn: cuenta concurrencia, exit manual.
+ * ID01-461: captura stdin (stdinWrites) y, si los args son `--mode rpc`,
+ * simula el protocolo: finishProc emite el stream JSONL (delta + message_end +
+ * agent_settled) y el proceso sale solo cuando el runtime cierra stdin.
+ */
+function makeFakeSpawn({ hangOnTerm = false, hangOnClose = false } = {}) {
 	const state = { spawned: 0, concurrent: 0, maxConcurrent: 0, procs: [], cmds: [], argss: [] };
 	state.spawnFn = (cmd, args, opts) => {
 		state.spawned++;
@@ -43,20 +48,56 @@ function makeFakeSpawn({ hangOnTerm = false } = {}) {
 		proc.stderr = new EventEmitter();
 		proc.exited = false;
 		proc.spawnOpts = opts;
+		proc.rpc = args.includes("--mode") && args.includes("rpc");
+		proc.stdinWrites = [];
+		proc.killSignals = [];
+		// stdin como EventEmitter (fiel al real): permite testear EPIPE async.
+		proc.stdin = new EventEmitter();
+		proc.stdin.write = (s) => {
+			proc.stdinWrites.push(String(s));
+			if (proc.stdinBroken) {
+				// EPIPE llega ASÍNCRONO, no como throw
+				setImmediate(() => proc.stdin.emit("error", Object.assign(new Error("write EPIPE"), { code: "EPIPE" })));
+				return false;
+			}
+			return true;
+		};
+		// cierre limpio rpc: stdin.end() → el proceso sale solo, salvo hangOnClose
+		proc.stdin.end = () => {
+			proc.stdinEnded = true;
+			if (proc.rpc && !hangOnClose) state.exitProc(proc, 0);
+		};
 		proc.kill = (signal) => {
+			proc.killSignals.push(signal);
+			if (proc.killSignals.length === 1) proc.writesAtFirstKill = proc.stdinWrites.length;
 			if (hangOnTerm && signal === "SIGTERM") return true; // simula proceso que ignora TERM
-			if (!proc.exited) state.finishProc(proc, null, signal);
+			state.exitProc(proc, null, signal);
 			return true;
 		};
 		state.procs.push(proc);
 		return proc;
 	};
-	state.finishProc = (proc, code = 0, signal = null, out = "ok") => {
+	state.exitProc = (proc, code = 0, signal = null) => {
 		if (proc.exited) return;
-		if (out) proc.stdout.emit("data", Buffer.from(out));
 		proc.exited = true;
 		state.concurrent--;
 		proc.emit("exit", code, signal);
+	};
+	/** Emite UNA línea JSONL por el stdout del fake. */
+	state.emitRpc = (proc, obj) => proc.stdout.emit("data", Buffer.from(JSON.stringify(obj) + "\n"));
+	state.finishProc = (proc, code = 0, signal = null, out = "ok") => {
+		if (proc.exited) return;
+		if (proc.rpc && !signal && code === 0) {
+			// stream rpc feliz; el exit lo dispara stdin.end() del runtime
+			if (out) {
+				state.emitRpc(proc, { type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: out } });
+				state.emitRpc(proc, { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: out }] } });
+			}
+			state.emitRpc(proc, { type: "agent_settled" });
+			return;
+		}
+		if (out) proc.stdout.emit("data", Buffer.from(out));
+		state.exitProc(proc, code, signal);
 	};
 	return state;
 }
@@ -184,6 +225,7 @@ await test("cap 4 vivos: 8 tasks, nunca más de 4 procesos simultáneos", async 
 
 await test("spawn args: PI absoluto + --session-dir (no --no-session) + env hijo PI_SUBAGENT_DEPTH=1", async () => {
 	const fake = makeFakeSpawn();
+	// childMode "print": este test fija el contrato de args del modo -p (461: el default es rpc)
 	const rt = createSubagentsRuntime({
 		spawnFn: fake.spawnFn,
 		piBin: "/fake/pi",
@@ -191,6 +233,7 @@ await test("spawn args: PI absoluto + --session-dir (no --no-session) + env hijo
 		now: () => 5000,
 		mkdirSessionDir: () => {},
 		rmSessionDir: () => {},
+		childMode: "print",
 	});
 	const batch = rt.runBatch([{ role: "review", prompt: "mirá" }]);
 	await tick();
@@ -202,7 +245,7 @@ await test("spawn args: PI absoluto + --session-dir (no --no-session) + env hijo
 		"--provider", "kimi-coding",
 		"--model", "k3",
 		"--thinking", "high",
-		"-p", "--session-dir", `/fake/sessions/${process.pid}-5000-1/t1`, "mirá",
+		"-p", "--session-dir", path.join("/fake/sessions", `${process.pid}-5000-1`, "t1"), "mirá",
 	]);
 	assert.ok(!fake.argss[0].includes("--no-session"), "434: ya no se pasa --no-session");
 	assert.equal(proc.spawnOpts.env.PI_SUBAGENT_DEPTH, "1");
@@ -213,7 +256,8 @@ await test("spawn args: PI absoluto + --session-dir (no --no-session) + env hijo
 await test("timeout: TERM ignorado → KILL → exitCode ≠ 0 y el batch sigue", async () => {
 	const fake = makeFakeSpawn({ hangOnTerm: true });
 	// timeoutFloorsMs: {} deshabilita el clamp por rol para poder testear con ms.
-	const rt = createSubagentsRuntime({ spawnFn: fake.spawnFn, killGraceMs: 20, timeoutFloorsMs: {} });
+	// childMode "print": este test fija el mensaje de timeout del modo -p (461: el de rpc difiere)
+	const rt = createSubagentsRuntime({ spawnFn: fake.spawnFn, killGraceMs: 20, timeoutFloorsMs: {}, childMode: "print" });
 	const batch = rt.runBatch([
 		{ id: "slow", prompt: "colgado", timeoutMs: 25 },
 		{ id: "fast", prompt: "rápido" },
@@ -756,7 +800,8 @@ await test("runBatch: usage inyectado en cada result; execute foreground arma en
 	assert.match(env.summary, /^1 tasks · [\d.]+s wall · [\d.]+s cpu · ~\$0\.01 total$/);
 	assert.equal(env.payg, false);
 	assert.equal(out.details.summary, env.summary);
-	assert.match(updates[0], /t1\/1 done · exit 0 · [\d.]+s · \$0\.01 · alibaba\/qwen3\.8-max/);
+	// 461: updates[0] puede ser un update inmediato de actividad (rpc); la línea done sigue saliendo
+	assert.match(updates.find((t) => t.includes("/1 done")), /t1\/1 done · exit 0 · [\d.]+s · \$0\.01 · alibaba\/qwen3\.8-max/);
 });
 
 await test("presupuesto foreground: acumulado >= max → el próximo NO spawnea (exit 125, skipped budget)", async () => {
@@ -875,6 +920,400 @@ await test("formatSubagentResult incluye ~$X o cost n/d (nunca nada más)", () =
 		formatSubagentResult({ id: "t2", role: "hard", model: "deepseek-payg/deepseek/deepseek-v4-pro", exitCode: 125, durationMs: 0, output: "skip", usage: { input: 0, output: 0, cacheRead: 0 }, skipped: "budget" }),
 		/^\[subagent t2 · hard · deepseek-payg\/deepseek\/deepseek-v4-pro · 0\.0s · exit 125 · cost n\/d\]/,
 	);
+});
+
+// ---------- ID01-461: modo rpc (streaming real) ----------
+
+await test("resolveChildMode: default rpc, env print, deps gana sobre env", () => {
+	assert.equal(resolveChildMode({}, {}), "rpc");
+	assert.equal(resolveChildMode({}, { PI_SUBAGENTS_CHILD_MODE: "print" }), "print");
+	assert.equal(resolveChildMode({}, { PI_SUBAGENTS_CHILD_MODE: "rpc" }), "rpc");
+	assert.equal(resolveChildMode({}, { PI_SUBAGENTS_CHILD_MODE: "basura" }), "rpc", "el env solo reconoce print");
+	assert.equal(resolveChildMode({ childMode: "print" }, {}), "print");
+	assert.equal(resolveChildMode({ childMode: "rpc" }, { PI_SUBAGENTS_CHILD_MODE: "print" }), "rpc", "deps pisa al env");
+	assert.equal(resolveChildMode({ childMode: "print" }, { PI_SUBAGENTS_CHILD_MODE: "rpc" }), "print");
+});
+
+await test("rpc feliz: prompt por stdin, args sin -p, output acumulado, exit 0", async () => {
+	const fake = makeFakeSpawn();
+	const rt = createSubagentsRuntime({
+		spawnFn: fake.spawnFn,
+		piBin: "/fake/pi",
+		sessionRoot: "/fake/s",
+		mkdirSessionDir: () => {},
+		rmSessionDir: () => {},
+	});
+	const batch = rt.runBatch([{ id: "r1", role: "review", prompt: "mirá esto" }]);
+	await tick();
+	const proc = fake.procs[0];
+	assert.equal(proc.rpc, true, "el fake detectó --mode rpc");
+	assert.deepEqual(fake.argss[0].slice(0, -1), [
+		"--mode", "rpc",
+		"--provider", "kimi-coding",
+		"--model", "k3",
+		"--thinking", "high",
+		"--session-dir",
+	]);
+	assert.ok(!fake.argss[0].includes("-p"), "rpc: sin -p ni prompt por argv");
+	assert.equal(proc.spawnOpts.stdio[0], "pipe", "rpc: stdin ES el canal");
+	assert.equal(proc.stdinWrites[0], `${JSON.stringify({ type: "prompt", message: "mirá esto" })}\n`);
+	fake.emitRpc(proc, { type: "response", command: "prompt", success: true }); // ack
+	fake.emitRpc(proc, { type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "primer chunk " } });
+	fake.emitRpc(proc, { type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "segundo chunk" } });
+	fake.emitRpc(proc, { type: "message_update", assistantMessageEvent: { type: "toolcall_end", contentIndex: 1, toolCall: { name: "bash", arguments: {} } } });
+	fake.emitRpc(proc, { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "primer chunk segundo chunk" }] } });
+	fake.emitRpc(proc, { type: "agent_settled" });
+	const [r] = await batch;
+	assert.equal(r.exitCode, 0);
+	assert.equal(r.output, "primer chunk segundo chunk", "message_end autoritativo");
+	assert.ok(proc.exited, "agent_settled → stdin.end() → el proceso sale solo");
+});
+
+// El hijo carga las extensiones globales: verify-gate (ID01-454) reinyecta un
+// turno de reparación DESPUÉS del agent_settled. Cerrar en el primer settle
+// mataría esa reparación a mitad → ventana de gracia (ID01-461).
+await test("rpc settle-grace: una reinyección post-settle NO corta el task", async () => {
+	const fake = makeFakeSpawn();
+	const rt = createSubagentsRuntime({
+		spawnFn: fake.spawnFn,
+		piBin: "/fake/pi",
+		sessionRoot: "/fake/s",
+		mkdirSessionDir: () => {},
+		rmSessionDir: () => {},
+		settleGraceMs: 60,
+		settleGraceProbe: () => true, // simula cwd con .pi-verify.json
+	});
+	const batch = rt.runBatch([{ id: "gate", role: "implement", prompt: "arreglá el bug" }]);
+	await tick();
+	const proc = fake.procs[0];
+	fake.emitRpc(proc, { type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "primer intento" } });
+	fake.emitRpc(proc, { type: "agent_settled" }); // gate rojo: acá el runtime NO debe cerrar
+	await tick(20); // dentro de la ventana de gracia
+	assert.equal(proc.exited, false, "no cerró en el primer settle");
+	// verify-gate reinyecta → turno nuevo
+	fake.emitRpc(proc, { type: "message_start", message: { role: "user", content: [{ type: "text", text: "[verify-gate] falló" }] } });
+	fake.emitRpc(proc, { type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: " + reparado" } });
+	await tick(100); // la gracia original ya venció: debe haber sido cancelada
+	assert.equal(proc.exited, false, "la actividad nueva canceló el cierre");
+	fake.emitRpc(proc, { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "primer intento + reparado" }] } });
+	fake.emitRpc(proc, { type: "agent_settled" }); // ahora sí, sin más actividad
+	const [r] = await batch;
+	assert.equal(r.exitCode, 0);
+	assert.equal(r.output, "primer intento + reparado", "conserva el trabajo post-reparación");
+	assert.ok(proc.exited, "cerró tras la gracia del segundo settle");
+});
+
+await test("rpc sin .pi-verify.json (probe false) → cierra en el primer settle, sin latencia extra", async () => {
+	const fake = makeFakeSpawn();
+	const rt = createSubagentsRuntime({
+		spawnFn: fake.spawnFn,
+		piBin: "/fake/pi",
+		sessionRoot: "/fake/s",
+		mkdirSessionDir: () => {},
+		rmSessionDir: () => {},
+		settleGraceMs: 60_000, // aunque la gracia sea enorme, el probe la desactiva
+		settleGraceProbe: () => false,
+	});
+	const batch = rt.runBatch([{ id: "x", role: "grunt", prompt: "hola" }]);
+	await tick();
+	const proc = fake.procs[0];
+	fake.emitRpc(proc, { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "ok" }] } });
+	fake.emitRpc(proc, { type: "agent_settled" });
+	const [r] = await batch;
+	assert.equal(r.exitCode, 0);
+	assert.ok(proc.exited);
+});
+
+// --- Hallazgos del review adversarial (2026-08-18) ---
+
+await test("rpc: hijo que NO sale al cerrar stdin → reaper TERM→KILL, sin huérfano", async () => {
+	const fake = makeFakeSpawn({ hangOnClose: true });
+	const rt = createSubagentsRuntime({
+		spawnFn: fake.spawnFn,
+		piBin: "/fake/pi",
+		sessionRoot: "/fake/s",
+		mkdirSessionDir: () => {},
+		rmSessionDir: () => {},
+		killGraceMs: 20,
+	});
+	const batch = rt.runBatch([{ id: "zombie", role: "grunt", prompt: "p" }]);
+	await tick();
+	const proc = fake.procs[0];
+	fake.emitRpc(proc, { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "listo" }] } });
+	fake.emitRpc(proc, { type: "agent_settled" });
+	await tick(10);
+	assert.equal(proc.stdinEnded, true, "cerró stdin");
+	assert.equal(proc.exited, false, "el hijo ignora el cierre (simulado)");
+	const [r] = await batch; // el reaper lo mata → exit → resuelve
+	assert.ok(proc.killSignals.includes("SIGTERM"), `reaper mandó TERM: ${proc.killSignals}`);
+	assert.equal(r.exitCode, 0, "exitCode del STREAM, no del proceso terminado");
+	assert.equal(r.output, "listo");
+});
+
+await test("rpc: EPIPE async al escribir el prompt no tumba el proceso padre", async () => {
+	const fake = makeFakeSpawn();
+	const rt = createSubagentsRuntime({
+		spawnFn: fake.spawnFn,
+		piBin: "/fake/pi",
+		sessionRoot: "/fake/s",
+		mkdirSessionDir: () => {},
+		rmSessionDir: () => {},
+	});
+	const origSpawn = fake.spawnFn;
+	const batch = rt.runBatch([{ id: "epipe", role: "grunt", prompt: "p" }]);
+	await tick();
+	const proc = fake.procs[0];
+	assert.ok(proc.stdin.listenerCount("error") > 0, "hay handler de error en stdin (si no, uncaughtException)");
+	proc.stdinBroken = true;
+	proc.stdin.write("x"); // dispara EPIPE async
+	await tick(5); // si no hubiera handler, acá moriría el proceso
+	fake.exitProc(proc, 1);
+	const [r] = await batch;
+	assert.equal(r.exitCode, 1);
+	assert.ok(r.output.includes("PI_SUBAGENTS_CHILD_MODE=print"), "hint de rpc no soportado");
+	assert.equal(typeof origSpawn, "function");
+});
+
+await test("rpc: settle DESPUÉS del abort por timeout sigue siendo 124, no exit 0", async () => {
+	const fake = makeFakeSpawn();
+	const rt = createSubagentsRuntime({
+		spawnFn: fake.spawnFn,
+		piBin: "/fake/pi",
+		sessionRoot: "/fake/s",
+		mkdirSessionDir: () => {},
+		rmSessionDir: () => {},
+		killGraceMs: 20,
+		timeoutFloorsMs: {},
+	});
+	const batch = rt.runBatch([{ id: "t", role: "grunt", prompt: "p", timeoutMs: 20 }]);
+	await tick();
+	const proc = fake.procs[0];
+	fake.emitRpc(proc, { type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "parcial" } });
+	await tick(40); // vence el timeout → el runtime manda {"type":"abort"}
+	assert.ok(
+		proc.stdinWrites.some((w) => w.includes('"abort"')),
+		"mandó abort por stdin",
+	);
+	// el hijo obedece el abort y settlea DENTRO de la ventana previa al SIGTERM
+	fake.emitRpc(proc, { type: "agent_settled" });
+	const [r] = await batch;
+	assert.equal(r.exitCode, 124, "el timeout manda por encima del cierre ordenado");
+	assert.ok(r.output.includes("timeout tras"), "conserva el mensaje de timeout");
+	assert.ok(r.output.includes("parcial"), "y el output parcial del stream");
+});
+
+await test("rpc: EPIPE disparado por el propio runtime (abort contra hijo muerto) no rompe nada", async () => {
+	const fake = makeFakeSpawn();
+	const rt = createSubagentsRuntime({
+		spawnFn: fake.spawnFn,
+		piBin: "/fake/pi",
+		sessionRoot: "/fake/s",
+		mkdirSessionDir: () => {},
+		rmSessionDir: () => {},
+		killGraceMs: 20,
+		timeoutFloorsMs: {},
+	});
+	const batch = rt.runBatch([{ id: "ep", role: "grunt", prompt: "p", timeoutMs: 20 }]);
+	await tick();
+	const proc = fake.procs[0];
+	proc.stdinBroken = true; // el hijo ya no lee: la escritura del runtime dará EPIPE
+	await tick(60); // vence el timeout → el RUNTIME escribe el abort → EPIPE async
+	fake.exitProc(proc, null, "SIGTERM");
+	const [r] = await batch;
+	assert.equal(r.exitCode, 124);
+	assert.ok(r.output.includes("timeout tras"));
+});
+
+await test("rpc: cierre ordenado ANTES del timeout → gana el stream (no 124)", async () => {
+	const fake = makeFakeSpawn({ hangOnClose: true });
+	const rt = createSubagentsRuntime({
+		spawnFn: fake.spawnFn,
+		piBin: "/fake/pi",
+		sessionRoot: "/fake/s",
+		mkdirSessionDir: () => {},
+		rmSessionDir: () => {},
+		killGraceMs: 30,
+		timeoutFloorsMs: {},
+	});
+	// El task settlea enseguida pero el hijo se cuelga en el shutdown; el timeout
+	// vence DESPUÉS de que el cierre ordenado ya arrancó.
+	const batch = rt.runBatch([{ id: "slowclose", role: "grunt", prompt: "p", timeoutMs: 40 }]);
+	await tick();
+	const proc = fake.procs[0];
+	fake.emitRpc(proc, { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "trabajo completo" }] } });
+	fake.emitRpc(proc, { type: "agent_settled" }); // cierre ordenado arranca acá
+	const [r] = await batch; // el reaper lo mata tras el timeout
+	assert.equal(r.exitCode, 0, "settleó completo antes del timeout: no debe reportarse 124");
+	assert.ok(r.output.includes("trabajo completo"));
+});
+
+await test("rpc: línea JSONL gigante se descarta sin acumular, y el stream sigue", async () => {
+	const fake = makeFakeSpawn();
+	const rt = createSubagentsRuntime({
+		spawnFn: fake.spawnFn,
+		piBin: "/fake/pi",
+		sessionRoot: "/fake/s",
+		mkdirSessionDir: () => {},
+		rmSessionDir: () => {},
+	});
+	const batch = rt.runBatch([{ id: "big", role: "grunt", prompt: "p" }]);
+	await tick();
+	const proc = fake.procs[0];
+	// 1.5 MB en una sola línea sin "\n" → supera el cap
+	proc.stdout.emit("data", Buffer.from("x".repeat(1_500_000)));
+	proc.stdout.emit("data", Buffer.from("basura-final\n")); // cierra la línea gigante
+	fake.emitRpc(proc, { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "sigo vivo" }] } });
+	fake.emitRpc(proc, { type: "agent_settled" });
+	const [r] = await batch;
+	assert.equal(r.exitCode, 0);
+	assert.ok(r.output.includes("sigo vivo"), "el stream siguió tras la línea gigante");
+	assert.ok(r.output.includes("descartado"), "el descarte NO es silencioso (se reporta en el output)");
+	assert.ok(!r.output.includes("xxxxxxxxxx"), "la línea gigante no entró al output");
+});
+
+await test("rpc: error transitorio seguido de mensaje nuevo NO reporta exitCode 1", async () => {
+	const fake = makeFakeSpawn();
+	const rt = createSubagentsRuntime({
+		spawnFn: fake.spawnFn,
+		piBin: "/fake/pi",
+		sessionRoot: "/fake/s",
+		mkdirSessionDir: () => {},
+		rmSessionDir: () => {},
+	});
+	const batch = rt.runBatch([{ id: "retry", role: "grunt", prompt: "p" }]);
+	await tick();
+	const proc = fake.procs[0];
+	fake.emitRpc(proc, { type: "message_update", assistantMessageEvent: { type: "error", reason: "error", error: { message: "429 rate limit" } } });
+	fake.emitRpc(proc, { type: "message_start", message: { role: "assistant", content: [] } }); // pi reintenta
+	fake.emitRpc(proc, { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "salió bien" }] } });
+	fake.emitRpc(proc, { type: "agent_settled" });
+	const [r] = await batch;
+	assert.equal(r.exitCode, 0, "el error transitorio no debe marcar el task como fallado");
+	assert.equal(r.output, "salió bien");
+});
+
+await test("rpc: turno multi-mensaje (post-reparación) conserva TODO el texto", async () => {
+	const fake = makeFakeSpawn();
+	const rt = createSubagentsRuntime({
+		spawnFn: fake.spawnFn,
+		piBin: "/fake/pi",
+		sessionRoot: "/fake/s",
+		mkdirSessionDir: () => {},
+		rmSessionDir: () => {},
+	});
+	const batch = rt.runBatch([{ id: "multi", role: "grunt", prompt: "p" }]);
+	await tick();
+	const proc = fake.procs[0];
+	fake.emitRpc(proc, { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "parte 1" }] } });
+	fake.emitRpc(proc, { type: "message_end", message: { role: "toolResult", content: [{ type: "text", text: "ruido de tool" }] } });
+	fake.emitRpc(proc, { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "parte 2" }] } });
+	fake.emitRpc(proc, { type: "agent_settled" });
+	const [r] = await batch;
+	assert.equal(r.output, "parte 1\nparte 2", "acumula assistant, ignora toolResult");
+});
+
+await test("rpc: la gracia se cancela con CUALQUIER evento, no solo con los 3 de la whitelist", async () => {
+	const fake = makeFakeSpawn();
+	const rt = createSubagentsRuntime({
+		spawnFn: fake.spawnFn,
+		piBin: "/fake/pi",
+		sessionRoot: "/fake/s",
+		mkdirSessionDir: () => {},
+		rmSessionDir: () => {},
+		settleGraceMs: 50,
+		settleGraceProbe: () => true,
+	});
+	const batch = rt.runBatch([{ id: "g", role: "implement", prompt: "p" }]);
+	await tick();
+	const proc = fake.procs[0];
+	fake.emitRpc(proc, { type: "agent_settled" });
+	await tick(20);
+	fake.emitRpc(proc, { type: "tool_execution_end", toolCallId: "1", toolName: "bash" }); // NO estaba en la whitelist vieja
+	await tick(60); // la gracia original ya habría vencido
+	assert.equal(proc.exited, false, "un evento fuera de la whitelist vieja cancela igual");
+	fake.emitRpc(proc, { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "reparado" }] } });
+	fake.emitRpc(proc, { type: "agent_settled" });
+	const [r] = await batch;
+	assert.equal(r.output, "reparado");
+});
+
+await test("rpc parser tolerante: chunk partido a la mitad + línea basura no-JSON", async () => {
+	const fake = makeFakeSpawn();
+	const rt = createSubagentsRuntime({ spawnFn: fake.spawnFn, mkdirSessionDir: () => {}, rmSessionDir: () => {} });
+	const batch = rt.runBatch([{ id: "p1", prompt: "x" }]);
+	await tick();
+	const proc = fake.procs[0];
+	const line = JSON.stringify({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "hola rpc" } });
+	proc.stdout.emit("data", Buffer.from(line.slice(0, 15))); // media línea, sin \n
+	proc.stdout.emit("data", Buffer.from(line.slice(15) + "\n")); // el resto
+	proc.stdout.emit("data", Buffer.from("WARNING pi: basura no json\n")); // warning, skip
+	fake.emitRpc(proc, { type: "agent_settled" });
+	const [r] = await batch;
+	assert.equal(r.exitCode, 0);
+	assert.equal(r.output, "hola rpc");
+});
+
+await test("rpc actividad: heartbeat la incluye, update inmediato al cambiar, thinking oculto", async () => {
+	const fake = makeFakeSpawn();
+	const rt = createSubagentsRuntime({ spawnFn: fake.spawnFn, heartbeatMs: 10, activityThrottleMs: 0, timeoutFloorsMs: {} });
+	const updates = [];
+	const batch = rt.runBatch([{ id: "act1", role: "review", prompt: "x" }], {
+		onUpdate: (u) => updates.push(u.content[0].text),
+	});
+	await tick();
+	const proc = fake.procs[0];
+	fake.emitRpc(proc, { type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "leyendo el parser de jsonl" } });
+	// throttle 0 → update inmediato, sin esperar al heartbeat
+	assert.ok(
+		updates.some((t) => t.includes("act1") && t.includes("— leyendo el parser de jsonl")),
+		`update inmediato con actividad, hubo: ${JSON.stringify(updates)}`,
+	);
+	// thinking_delta NO es actividad
+	fake.emitRpc(proc, { type: "message_update", assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "PENSAMIENTO SECRETO" } });
+	assert.ok(!updates.some((t) => t.includes("PENSAMIENTO")), "el thinking no se muestra");
+	await tick(25); // al menos un heartbeat con la actividad rodante
+	const beats = updates.filter((t) => t.includes("⏳") && t.includes("done,"));
+	assert.ok(beats.some((t) => t.includes("act1") && t.includes("— leyendo el parser de jsonl")), `heartbeat con actividad: ${JSON.stringify(beats)}`);
+	// tool en curso → ⚙ nombre
+	fake.emitRpc(proc, { type: "tool_execution_start", toolCallId: "1", toolName: "bash", args: {} });
+	assert.ok(updates.some((t) => t.includes("act1") && t.includes("— ⚙ bash")), "actividad de tool");
+	fake.emitRpc(proc, { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "listo" }] } });
+	fake.emitRpc(proc, { type: "agent_settled" });
+	const [r] = await batch;
+	assert.equal(r.exitCode, 0);
+	assert.equal(r.output, "listo");
+});
+
+await test("rpc error: assistantMessageEvent error → exitCode 1 con el motivo", async () => {
+	const fake = makeFakeSpawn();
+	const rt = createSubagentsRuntime({ spawnFn: fake.spawnFn, mkdirSessionDir: () => {}, rmSessionDir: () => {} });
+	const batch = rt.runBatch([{ id: "e1", prompt: "x" }]);
+	await tick();
+	const proc = fake.procs[0];
+	fake.emitRpc(proc, { type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "arrancó" } });
+	fake.emitRpc(proc, { type: "message_update", assistantMessageEvent: { type: "error", error: { message: "boom modelo" } } });
+	fake.emitRpc(proc, { type: "agent_settled" });
+	const [r] = await batch;
+	assert.equal(r.exitCode, 1);
+	assert.ok(r.output.includes("boom modelo"), "el motivo va en el output");
+	assert.ok(r.output.includes("arrancó"), "el texto parcial se conserva");
+});
+
+await test("rpc timeout: abort por stdin ANTES del SIGTERM y output parcial conservado", async () => {
+	const fake = makeFakeSpawn();
+	const rt = createSubagentsRuntime({ spawnFn: fake.spawnFn, killGraceMs: 20, timeoutFloorsMs: {} });
+	const batch = rt.runBatch([{ id: "slowrpc", prompt: "colgado", timeoutMs: 25 }]);
+	await tick();
+	const proc = fake.procs[0];
+	fake.emitRpc(proc, { type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "parcial rpc" } });
+	const [r] = await batch;
+	assert.equal(r.exitCode, 124);
+	assert.ok(proc.stdinWrites.includes('{"type":"abort"}\n'), "abort amable por el canal");
+	assert.equal(proc.writesAtFirstKill, 2, "prompt + abort escritos antes del SIGTERM");
+	assert.deepEqual(proc.killSignals, ["SIGTERM"], "el fake sale con TERM (no cuelga)");
+	assert.ok(r.output.includes("parcial rpc"), "en rpc el output parcial SÍ se conserva");
+	assert.match(r.output, /timeout tras \d+s/);
+	assert.ok(!r.output.includes("modo -p"), "mensaje adaptado a rpc");
 });
 
 // ---------- E2E (opt-in) ----------
