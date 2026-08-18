@@ -88,6 +88,7 @@ struct HomeView: View {
             }
             .sheet(isPresented: $showNewSpace) {
                 NewSpaceSheet { spaceId in
+                    spaceFilter = spaceId
                     path.append(.space(spaceId))
                 }
             }
@@ -211,10 +212,16 @@ struct HomeView: View {
                         }
                     }
                 }
+                Divider()
+                Button {
+                    showNewSpace = true
+                } label: {
+                    Label("New space…", systemImage: "folder.badge.plus")
+                }
             } label: {
                 Image(systemName: "plus")
             }
-            .accessibilityLabel("New session")
+            .accessibilityLabel("New session or space")
         }
     }
 
