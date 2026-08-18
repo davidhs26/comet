@@ -21,6 +21,11 @@
  * presupuesto PI_SUBAGENTS_MAX_COST_USD (tasks NUEVOS no se despachan; los
  * vivos terminan) y status().totals (best-effort, ring de 20).
  *
+ * v4 (ID01-461): hijos en modo rpc (`pi --mode rpc`, prompt por stdin, eventos
+ * JSONL por stdout) → streaming real: output incremental (no solo al final),
+ * actividad rodante en el heartbeat y updates inmediatos throttlados.
+ * `PI_SUBAGENTS_CHILD_MODE=print` vuelve al modo `-p` (fallback de emergencia).
+ *
  * No toca el engine.
  */
 import { spawn, type ChildProcess } from "node:child_process";
@@ -97,6 +102,80 @@ export function effectiveTimeoutMs(
  * el engine Zeron parkea turnos tras ~30s de silencio (settle window).
  */
 export const HEARTBEAT_INTERVAL_MS = 20_000;
+
+/**
+ * Throttle de updates inmediatos por cambio de actividad (ID01-461): si la
+ * actividad de un task cambia y pasaron ≥ esto desde el último update emitido
+ * para ese task, se emite YA (sin esperar al próximo heartbeat).
+ */
+export const ACTIVITY_THROTTLE_MS = 5_000;
+/**
+ * Ventana de gracia tras `agent_settled` antes de dar el task por terminado
+ * (ID01-461). El hijo carga las extensiones globales: si el repo tiene
+ * `.pi-verify.json`, verify-gate (ID01-454) reinyecta un turno de reparación.
+ * Cerrar stdin en el primer settle mataría esa reparación a mitad (el
+ * `shutdown()` del modo rpc hace `process.exit` sin esperar el turno en vuelo).
+ *
+ * La ventana solo cubre el time-to-first-token del turno reinyectado, no la
+ * duración de los tests: pi awaitea los handlers de extensión ANTES de emitir
+ * el evento al stream (`_emitAgentSettled`, core/agent-session.ts:604-610), así
+ * que cuando el padre VE el settle, el gate ya corrió sus comandos y ya
+ * reinyectó. 15s cubren TTFT lento (review@high, provider en cola) — el review
+ * adversarial marcó que 3s se comían reparaciones reales. CUALQUIER evento del
+ * stream cancela la ventana.
+ *
+ * Solo se activa si el cwd del task tiene `.pi-verify.json` — el mismo lookup
+ * que hace verify-gate (`loadConfig(ctx.cwd)`), así que no hay desalineación.
+ */
+export const SETTLE_GRACE_MS = 15_000;
+/**
+ * Cap del buffer de línea JSONL del stream rpc (se descarta hasta el próximo \n).
+ * Son CHARS de JS (UTF-16), no bytes: el consumo real puede ser mayor.
+ */
+export const RPC_LINE_CAP_CHARS = 1_048_576;
+/** Espera entre el `abort` por stdin y el ladder de señales, en timeout rpc. */
+export const RPC_ABORT_GRACE_MS = 1_500;
+/** Throttle del recálculo de actividad desde los deltas de texto. */
+export const ACTIVITY_RECALC_MS = 500;
+
+/** Cap de la actividad rodante: una línea, sin newlines. */
+export const ACTIVITY_CAP_CHARS = 80;
+
+/**
+ * Actividad rodante desde el texto acumulado del assistant: última línea no
+ * vacía, capeada a ACTIVITY_CAP_CHARS con "…". Sin texto → undefined.
+ */
+export function activityFromText(text: string): string | undefined {
+	const lines = text.split("\n");
+	for (let i = lines.length - 1; i >= 0; i--) {
+		const l = lines[i].trim();
+		if (l) return l.length > ACTIVITY_CAP_CHARS ? `${l.slice(0, ACTIVITY_CAP_CHARS - 1)}…` : l;
+	}
+	return undefined;
+}
+
+/** Texto plano de un `message_end` assistant (bloques content[].type==="text"). */
+function textFromMessage(message: unknown): string {
+	const content = (message as { content?: unknown } | undefined)?.content;
+	if (!Array.isArray(content)) return "";
+	return content
+		.map((b) =>
+			b && typeof b === "object" && (b as { type?: unknown }).type === "text"
+				? String((b as { text?: unknown }).text ?? "")
+				: "",
+		)
+		.join("");
+}
+
+/** Motivo legible de un assistantMessageEvent type==="error" (modo rpc). */
+function rpcErrorText(ame: Record<string, unknown>): string {
+	const err = ame.error;
+	if (err && typeof err === "object" && typeof (err as { message?: unknown }).message === "string") {
+		return (err as { message: string }).message;
+	}
+	if (typeof ame.message === "string") return ame.message;
+	return JSON.stringify(ame).slice(0, 200);
+}
 
 /**
  * Resuelve provider/model/thinking para un task. `modelOverride` se splitea en
@@ -422,6 +501,29 @@ export interface RuntimeDeps {
 	timeoutFloorsMs?: Partial<Record<Role, number>>;
 	/** Intervalo del heartbeat de progreso; 0 lo deshabilita. */
 	heartbeatMs?: number;
+	/** ID01-461: modo del hijo; default rpc. Gana sobre PI_SUBAGENTS_CHILD_MODE. */
+	childMode?: ChildMode;
+	/** Throttle de updates inmediatos por cambio de actividad (ID01-461). */
+	activityThrottleMs?: number;
+	/** Gracia post-settle antes de cerrar el task rpc (0 = cerrar al primer settle). */
+	settleGraceMs?: number;
+	/**
+	 * ¿El cwd del task puede reinyectar turnos post-settle? Default: existe
+	 * `.pi-verify.json` (verify-gate, ID01-454). Si es false, el cierre es
+	 * inmediato — sin impuesto de latencia en el caso común.
+	 */
+	settleGraceProbe?: (cwd: string) => boolean;
+}
+
+export type ChildMode = "print" | "rpc";
+
+/**
+ * Modo del hijo (ID01-461): default "rpc" (streaming real). deps.childMode gana
+ * sobre el env; el env solo reconoce "print" (fallback de emergencia a `-p`).
+ */
+export function resolveChildMode(deps: Pick<RuntimeDeps, "childMode">, env: NodeJS.ProcessEnv): ChildMode {
+	if (deps.childMode) return deps.childMode;
+	return env.PI_SUBAGENTS_CHILD_MODE === "print" ? "print" : "rpc";
 }
 
 interface ResolvedTask {
@@ -444,6 +546,18 @@ export function createSubagentsRuntime(deps: RuntimeDeps = {}) {
 	const now: () => number = deps.now ?? Date.now;
 	const timeoutFloorsMs: Partial<Record<Role, number>> = deps.timeoutFloorsMs ?? ROLE_TIMEOUT_FLOOR_MS;
 	const heartbeatMs: number = deps.heartbeatMs ?? HEARTBEAT_INTERVAL_MS;
+	const childMode: ChildMode = resolveChildMode(deps, deps.env ?? process.env);
+	const activityThrottleMs: number = deps.activityThrottleMs ?? ACTIVITY_THROTTLE_MS;
+	const settleGraceMs: number = deps.settleGraceMs ?? SETTLE_GRACE_MS;
+	const settleGraceProbe: (cwd: string) => boolean =
+		deps.settleGraceProbe ??
+		((cwd) => {
+			try {
+				return fs.existsSync(path.join(cwd, ".pi-verify.json"));
+			} catch {
+				return false;
+			}
+		});
 	const concurrency: number = deps.concurrency ?? MAX_CONCURRENCY;
 	const killGraceMs: number = deps.killGraceMs ?? KILL_GRACE_MS;
 	const piBin: string = deps.piBin ?? defaultPiBin();
@@ -521,7 +635,11 @@ export function createSubagentsRuntime(deps: RuntimeDeps = {}) {
 		}
 	}
 
-	async function runTask(task: ResolvedTask, batchKey: string): Promise<SubagentResult> {
+	async function runTask(
+		task: ResolvedTask,
+		batchKey: string,
+		onActivity?: (activity: string) => void,
+	): Promise<SubagentResult> {
 		const startedAt = now();
 		// ID01-434 (decisión congelada): hijo CON sesión en dir descartable →
 		// usage del jsonl; stdout print-mode intacto. Se borra en finish SIEMPRE.
@@ -536,21 +654,83 @@ export function createSubagentsRuntime(deps: RuntimeDeps = {}) {
 		return new Promise<SubagentResult>((resolve) => {
 			let settled = false;
 			let timedOut = false;
+			// rpc: motivo del assistantMessageEvent error → exitCode 1 en agent_settled
+			let rpcError: string | undefined;
 			let timer: ReturnType<typeof setTimeout> | undefined;
-			let killTimer: ReturnType<typeof setTimeout> | undefined;
+			// Declarados ANTES de finish: finish los cancela (evita TDZ).
+			let settleTimer: ReturnType<typeof setTimeout> | undefined;
+			/**
+			 * Timers de señales (reap de cierre y ladder de timeout) en un SET, no en
+			 * slots únicos: los dos caminos pueden solaparse y una variable compartida
+			 * dejaba un timer huérfano y, peor, hacía que el callback de uno borrara de
+			 * `pendingKills` el handle del otro (leak permanente del set global).
+			 */
+			const localKills = new Set<ReturnType<typeof setTimeout>>();
+			const scheduleKill = (delayMs: number): void => {
+				const t = setTimeout(() => {
+					localKills.delete(t);
+					pendingKills.delete(t); // el handle propio, no una variable externa
+					try {
+						child.kill("SIGKILL");
+					} catch {
+						/* ya muerto */
+					}
+				}, delayMs);
+				localKills.add(t);
+				pendingKills.add(t);
+			};
+			const scheduleReap = (delayMs: number): void => {
+				const t = setTimeout(() => {
+					localKills.delete(t);
+					try {
+						child.kill("SIGTERM");
+					} catch {
+						/* ya muerto */
+					}
+					scheduleKill(killGraceMs);
+				}, delayMs);
+				localKills.add(t);
+			};
+			// rpc: cierre en curso (stdin cerrado, esperando el exit del hijo).
+			let closing = false;
+			// ¿El cierre ordenado arrancó ANTES del timeout? Solo entonces el stream
+			// define el exitCode; si el timeout venció primero, manda 124. Sin esta
+			// distinción, un task que settleó completo y se colgó en el shutdown se
+			// reportaría 124 y el orquestador lo re-correría (caro en implement).
+			let closedBeforeTimeout = false;
+			// rpc: ¿llegó AL MENOS un evento JSON? Si no y el hijo falló, casi seguro
+			// el pi instalado no soporta --mode rpc → hint accionable en el output.
+			let sawRpcEvent = false;
+			// rpc: mensajes assistant ya cerrados + buffer de deltas del mensaje en
+			// curso. El output final los concatena (un turno puede tener varios).
+			const finalParts: string[] = [];
+			let deltaBuf = "";
+			let lastActivityCalcAt = 0;
 			let child: ChildProcess;
 			const finish = (exitCode: number, extraErr?: string) => {
 				if (settled) return;
 				settled = true;
 				if (timer) clearTimeout(timer);
-				if (killTimer) {
-					clearTimeout(killTimer);
-					pendingKills.delete(killTimer);
+				if (settleTimer) clearTimeout(settleTimer);
+				for (const t of localKills) {
+					clearTimeout(t);
+					pendingKills.delete(t);
 				}
+				localKills.clear();
 				live.delete(child);
+				// Solo si hubo eventos: si no los hubo, `stdout` trae el crudo del hijo
+				// (banner/ayuda), que es el único diagnóstico disponible.
+				if (childMode === "rpc" && sawRpcEvent) {
+					stdout = trimTail([...finalParts, deltaBuf].filter(Boolean).join("\n"));
+				}
 				const parts = [stdout];
 				if (stderr) parts.push(`[stderr]\n${stderr}`);
 				if (extraErr) parts.push(extraErr);
+				// Último: `trimTail` recorta por la cabeza, y este aviso importa
+				// justamente cuando el output es grande.
+				if (rpcDropped > 0) {
+					parts.push(`[subagents: ${rpcDropped} evento(s) rpc descartado(s) por superar ${RPC_LINE_CAP_CHARS} chars — el output puede estar incompleto]`);
+				}
 				const output = trimTail(parts.filter(Boolean).join("\n"));
 				// finally (exit/timeout/kill/error): usage del jsonl o fallback chars;
 				// el dir se borra SIEMPRE, también en fallo.
@@ -575,57 +755,272 @@ export function createSubagentsRuntime(deps: RuntimeDeps = {}) {
 					usage,
 				});
 			};
+			const isRpc = childMode === "rpc";
+			// Gracia solo si el cwd puede reinyectar (verify-gate); si no, cierre
+			// inmediato al settle — sin latencia extra en el caso común.
+			const taskCwd = task.cwd ?? deps.cwdDefault ?? process.cwd();
+			const graceMs = settleGraceProbe(taskCwd) ? settleGraceMs : 0;
+			// Actividad rodante (ID01-461): se reporta al batch solo si cambia.
+			let lastActivity: string | undefined;
+			const setActivity = (a: string | undefined): void => {
+				if (!a || a === lastActivity || !onActivity) return;
+				lastActivity = a;
+				try {
+					onActivity(a);
+				} catch {
+					/* un update no debe tumbar el task */
+				}
+			};
+			/**
+			 * Parser JSONL tolerante (ID01-461): una línea por evento; las líneas
+			 * no-JSON (warnings de pi) se skipean. Un chunk de stdout puede partir
+			 * una línea por la mitad → buffer + split por "\n" (rpcBuf abajo).
+			 */
+			// Gracia post-settle: si el hijo arranca otro turno (verify-gate
+			// reinyectando, retry de una extensión), se cancela el cierre.
+			const closeRpcChild = (): void => {
+				if (settled || closing) return;
+				closing = true;
+				closedBeforeTimeout = !timedOut;
+				// stdin.end() PRIMERO y resolvemos en el 'exit': si resolviéramos acá,
+				// un hijo que no sale (shutdown colgado, grandchild) quedaría huérfano
+				// —fuera de `live`, sin timeout, invisible a killAll— y además el usage
+				// se leería del jsonl sin flushear. NUNCA cerrar stdin antes del settle.
+				try {
+					child.stdin?.end();
+				} catch {
+					/* stdin ya cerrado */
+				}
+				// Reaper: si no sale por las suyas, TERM → +grace → KILL. El timeout
+				// general del task sigue armado como última red.
+				scheduleReap(killGraceMs);
+			};
+			const cancelPendingSettle = (): void => {
+				if (settleTimer) {
+					clearTimeout(settleTimer);
+					settleTimer = undefined;
+				}
+			};
+			const handleRpcLine = (line: string): void => {
+				const trimmed = line.trim();
+				if (!trimmed) return;
+				let ev: Record<string, unknown>;
+				try {
+					ev = JSON.parse(trimmed);
+				} catch {
+					return; // warning / basura no-JSON
+				}
+				if (!ev || typeof ev !== "object") return;
+				sawRpcEvent = true;
+				// CUALQUIER evento que no sea el settle es señal de trabajo vivo y
+				// cancela un cierre en gracia (whitelist estrecha = cerrar a mitad de
+				// una reparación de verify-gate y reportar exit 0 — hallazgo del review).
+				if (ev.type !== "agent_settled") cancelPendingSettle();
+				if (ev.type === "message_start" && (ev.message as { role?: unknown } | undefined)?.role === "assistant") {
+					// SOLO assistant: es el retry de pi tras un error transitorio (429),
+					// que sin esto reportaría exit 1 con output bueno. Un message_start
+					// de role user (reinyección de verify-gate) NO limpia el error: si el
+					// turno falló de verdad, el fallo debe sobrevivir a la reparación.
+					rpcError = undefined;
+				}
+				if (ev.type === "message_update") {
+					const ame = ev.assistantMessageEvent as Record<string, unknown> | undefined;
+					if (!ame) return;
+					if (ame.type === "text_delta" && typeof ame.delta === "string") {
+						deltaBuf = trimTail(deltaBuf + ame.delta);
+						// Actividad con throttle temporal: recalcularla por token es O(n)
+						// por delta (split del buffer entero) × concurrencia.
+						const t = now();
+						if (t - lastActivityCalcAt >= ACTIVITY_RECALC_MS) {
+							lastActivityCalcAt = t;
+							setActivity(activityFromText(deltaBuf));
+						}
+					} else if (ame.type === "toolcall_end") {
+						const name = (ame.toolCall as { name?: unknown } | undefined)?.name;
+						if (typeof name === "string") setActivity(`⚙ ${name}`);
+					} else if (ame.type === "error") {
+						rpcError = rpcErrorText(ame);
+					}
+					// thinking_delta y el resto (start/end/delta de toolcall, done):
+					// no aportan al output ni a la actividad → ignorados
+				} else if (ev.type === "message_end" && (ev.message as { role?: unknown } | undefined)?.role === "assistant") {
+					// Mensaje assistant cerrado: es la versión autoritativa de ESE
+					// mensaje. Se acumula (un turno puede tener varios, p.ej. tras una
+					// reparación de verify-gate) y se limpia el buffer de deltas.
+					const text = textFromMessage(ev.message);
+					deltaBuf = "";
+					if (text) {
+						finalParts.push(text);
+						// Cap continuo: una sesión agéntica larga acumula decenas de
+						// mensajes assistant × N hijos en el padre si solo se recorta al
+						// final. Se colapsa a la cola apenas supera el cap.
+						const joined = finalParts.join("\n");
+						if (joined.length > OUTPUT_CAP_BYTES) {
+							finalParts.length = 0;
+							finalParts.push(trimTail(joined));
+						}
+						setActivity(activityFromText(text));
+					}
+				} else if (ev.type === "tool_execution_start" && typeof ev.toolName === "string") {
+					setActivity(`⚙ ${ev.toolName}`);
+				} else if (ev.type === "agent_settled") {
+					// Fin del turno (sin retry/compaction/continuación pendiente).
+					// NO cerramos de una: una extensión del hijo (verify-gate) puede
+					// reinyectar un turno de reparación justo después. Esperamos la
+					// ventana de gracia; si llega actividad, se cancela el cierre.
+					cancelPendingSettle();
+					if (graceMs <= 0) {
+						closeRpcChild();
+					} else {
+						// SIN unref: la gracia debe sostener el event loop; si el proceso
+						// saliera antes, el task quedaría sin resolver.
+						settleTimer = setTimeout(closeRpcChild, graceMs);
+					}
+				}
+			};
+			let rpcBuf = "";
+			let rpcSkipLine = false; // descartando una línea que superó el cap
+			let rpcDropped = 0; // cuántas líneas se descartaron (se reporta al final)
 			child = spawnFn(
 				piBin,
-				[
-					"--provider",
-					task.route.provider,
-					"--model",
-					task.route.model,
-					"--thinking",
-					task.route.thinking,
-					"-p",
-					"--session-dir",
-					sessionDir,
-					task.prompt,
-				],
+				isRpc
+					? [
+							"--mode",
+							"rpc",
+							"--provider",
+							task.route.provider,
+							"--model",
+							task.route.model,
+							"--thinking",
+							task.route.thinking,
+							"--session-dir",
+							sessionDir,
+						]
+					: [
+							"--provider",
+							task.route.provider,
+							"--model",
+							task.route.model,
+							"--thinking",
+							task.route.thinking,
+							"-p",
+							"--session-dir",
+							sessionDir,
+							task.prompt,
+						],
 				{
 					cwd: task.cwd ?? deps.cwdDefault ?? process.cwd(),
 					env: { ...baseEnv, PI_SUBAGENT_DEPTH: "1" },
-					stdio: ["ignore", "pipe", "pipe"],
+					// rpc: stdin ES el canal (pipe) — NO cerrarlo al arrancar
+					stdio: isRpc ? ["pipe", "pipe", "pipe"] : ["ignore", "pipe", "pipe"],
 				},
 			);
 			live.add(child);
+			if (isRpc) {
+				// EPIPE se emite ASÍNCRONO: sin handler, un hijo que muere al arrancar
+				// (flag inválido, auth, OOM) tumba al pi PADRE por uncaughtException.
+				child.stdin?.on("error", () => {
+					/* el hijo murió; el handler de exit/error resuelve el task */
+				});
+				// El prompt va por stdin: una línea JSON + "\n"
+				try {
+					child.stdin?.write(`${JSON.stringify({ type: "prompt", message: task.prompt })}\n`);
+				} catch {
+					/* stdin roto → el handler de exit/error resuelve */
+				}
+			}
 			timer = setTimeout(() => {
 				timedOut = true;
-				try {
-					child.kill("SIGTERM");
-				} catch {
-					/* noop */
-				}
-				killTimer = setTimeout(() => {
-					pendingKills.delete(killTimer!);
+				if (isRpc) {
+					// abort amable por el canal y recién después el ladder de señales:
+					// en el mismo tick el abort no llega a procesarse.
 					try {
-						child.kill("SIGKILL");
+						child.stdin?.write('{"type":"abort"}\n');
 					} catch {
 						/* noop */
 					}
-				}, killGraceMs);
-				pendingKills.add(killTimer);
+					scheduleReap(RPC_ABORT_GRACE_MS);
+				} else {
+					try {
+						child.kill("SIGTERM");
+					} catch {
+						/* noop */
+					}
+					scheduleKill(killGraceMs);
+				}
 			}, effectiveTimeoutMs(task.role, task.timeoutMs, timeoutFloorsMs));
 			child.stdout?.on("data", (d: Buffer) => {
-				stdout = trimTail(stdout + d.toString("utf8"));
+				if (!isRpc) {
+					stdout = trimTail(stdout + d.toString("utf8"));
+					return;
+				}
+				// Mientras no haya llegado NINGÚN evento, conservamos el stdout crudo:
+				// si el pi instalado no soporta --mode rpc, es el único diagnóstico.
+				if (!sawRpcEvent) stdout = trimTail(stdout + d.toString("utf8"));
+				rpcBuf += d.toString("utf8");
+				let idx: number;
+				while ((idx = rpcBuf.indexOf("\n")) >= 0) {
+					const line = rpcBuf.slice(0, idx);
+					rpcBuf = rpcBuf.slice(idx + 1);
+					if (rpcSkipLine) {
+						// veníamos descartando una línea gigante: acá termina
+						rpcSkipLine = false;
+						continue;
+					}
+					handleRpcLine(line);
+				}
+				// Cap del buffer: una sola línea JSONL gigante (un evento que acarrea
+				// el contenido de un archivo) se acumularía entera en el PADRE, ×N
+				// hijos, y después se parsearía. Se descarta hasta el próximo "\n".
+				if (rpcBuf.length > RPC_LINE_CAP_CHARS) {
+					// Solo la transición cuenta: una línea de 5MB llega en varios chunks
+					// y desbordaría el cap una vez por chunk (sobreconteo).
+					if (!rpcSkipLine) rpcDropped++;
+					rpcBuf = "";
+					rpcSkipLine = true;
+				}
 			});
 			child.stderr?.on("data", (d: Buffer) => {
 				stderr = trimTail(stderr + d.toString("utf8"));
 			});
 			child.on("error", (err: Error) => finish(-1, `spawn error: ${err.message}`));
 			child.on("exit", (code: number | null) => {
+				// Flush del remanente sin "\n" final: un último evento quedaría afuera.
+				if (isRpc && !rpcSkipLine && rpcBuf.trim()) {
+					const rest = rpcBuf;
+					rpcBuf = "";
+					handleRpcLine(rest);
+				}
+				// El stream define el exitCode SOLO si el cierre ordenado arrancó antes
+				// del timeout. Si el timeout vino primero (el hijo settleó por el
+				// `abort`), manda 124: si no, un task que reventó el tiempo se
+				// reportaría exitoso.
+				if (closing && closedBeforeTimeout) {
+					// Cierre ordenado post-settle: el exitCode lo define el STREAM
+					// (el proceso puede salir 143 si hubo que TERMinarlo).
+					finish(
+						rpcError ? 1 : 0,
+						rpcError ? `subagents: el hijo reportó error: ${rpcError}` : undefined,
+					);
+					return;
+				}
+				if (isRpc && !timedOut && !sawRpcEvent) {
+					// Ni un solo evento JSON — incluso con exit 0 (banner/ayuda por
+					// stdout): sin esto quedaría exit 0 con output vacío y sin pista.
+					// El stdout crudo se conservó justamente para este caso.
+					finish(
+						code ?? -1,
+						`subagents: el hijo terminó (exit ${code ?? -1}) sin emitir ningún evento rpc. Si el pi instalado no soporta "--mode rpc", corré con PI_SUBAGENTS_CHILD_MODE=print.`,
+					);
+					return;
+				}
 				if (timedOut) {
 					const secs = Math.round(effectiveTimeoutMs(task.role, task.timeoutMs, timeoutFloorsMs) / 1000);
 					finish(
 						TIMEOUT_EXIT_CODE,
-						`subagents: timeout tras ${secs}s — en modo -p el output se emite recién al final; la task probablemente seguía trabajando. Reintentá con timeoutMs mayor o partí la task en pasos más chicos.`,
+						isRpc
+							? `subagents: timeout tras ${secs}s — el output parcial (stream rpc) se conserva arriba; la task probablemente seguía trabajando. Reintentá con timeoutMs mayor o partí la task en pasos más chicos.`
+							: `subagents: timeout tras ${secs}s — en modo -p el output se emite recién al final; la task probablemente seguía trabajando. Reintentá con timeoutMs mayor o partí la task en pasos más chicos.`,
 					);
 				} else {
 					finish(code ?? -1);
@@ -661,7 +1056,10 @@ export function createSubagentsRuntime(deps: RuntimeDeps = {}) {
 		// Heartbeat (directiva 2026-08-18): tasks vivas + elapsed cada ≤25s.
 		// Mantiene vivo el stream ACP (el engine parkea a los ~30s de silencio)
 		// y le muestra al usuario en qué se está trabajando.
-		const inFlight = new Map<string, { role: Role; model: string; startedAt: number }>();
+		const inFlight = new Map<
+			string,
+			{ role: Role; model: string; startedAt: number; activity?: string; lastActivityEmitAt: number }
+		>();
 		// Hallazgo k3 (review 2026-08-18): onUpdate puede lanzar si el host está en
 		// teardown — nunca debe tumbar el batch ni el interval.
 		const emitUpdate = (text: string): void => {
@@ -676,7 +1074,11 @@ export function createSubagentsRuntime(deps: RuntimeDeps = {}) {
 			heartbeat = setInterval(() => {
 				if (inFlight.size === 0) return;
 				const live = [...inFlight.entries()]
-					.map(([id, e]) => `${id} (${e.role}·${e.model}) ${Math.round((now() - e.startedAt) / 1000)}s`)
+					.map(
+						([id, e]) =>
+							// ID01-461: si hay actividad rodante (modo rpc), se muestra
+							`${id} (${e.role}·${e.model}) ${Math.round((now() - e.startedAt) / 1000)}s${e.activity ? ` — ${e.activity}` : ""}`,
+					)
 					.join(" · ");
 				const done = results.filter((r) => r !== undefined).length;
 				emitUpdate(`subagents: ⏳ ${live} — ${done}/${resolved.length} done, ${queue.length} en cola`);
@@ -703,10 +1105,21 @@ export function createSubagentsRuntime(deps: RuntimeDeps = {}) {
 					role: next.task.role,
 					model: modelKey(next.task.route),
 					startedAt: now(),
+					lastActivityEmitAt: 0,
 				});
 				let r: SubagentResult;
 				try {
-					r = await runTask(next.task, batchKey);
+					r = await runTask(next.task, batchKey, (activity) => {
+						const e = inFlight.get(next.task.id);
+						if (!e || e.activity === activity) return;
+						e.activity = activity;
+						// ID01-461: update inmediato throttlado, sin esperar al heartbeat
+						const t = now();
+						if (t - e.lastActivityEmitAt >= activityThrottleMs) {
+							e.lastActivityEmitAt = t;
+							emitUpdate(`subagents: ⏳ ${next.task.id} (${e.role}·${e.model}) — ${activity}`);
+						}
+					});
 				} finally {
 					inFlight.delete(next.task.id);
 				}
