@@ -5,10 +5,16 @@
  * {id, role, model, exitCode, durationMs, output} por task. Reemplaza el
  * patrón `pi … & wait` del AGENTS.md para tandas paralelas.
  *
+ * v2 (ID01-433): `background:true` despacha y retorna YA con {dispatched, note};
+ * los resultados llegan solos como mensajes `subagent-result` vía pi.sendMessage
+ * (chooseDeliverAs: steer si el agente está vivo, nextTurn si idle — jamás
+ * triggerTurn). Tool nueva `subagents_status` (running + ring de 20 completados).
+ * Background NO es durable: el store vive en el proceso pi, no sobrevive restart.
+ *
  * - Copia versionada: /home/david/comet/tooling/pi-extensions/subagents.ts
  * - Copia runtime:    ~/.pi/agent/extensions/subagents.ts (mismos bytes)
  *
- * v1 foreground: sin `background` (eso es ID01-433). No toca el engine.
+ * No toca el engine.
  */
 import { spawn, type ChildProcess } from "node:child_process";
 import * as os from "node:os";
@@ -108,6 +114,22 @@ export function trimTail(text: string, capBytes: number = OUTPUT_CAP_BYTES): str
 	return `[…${start} bytes recortados del inicio]\n${buf.subarray(start).toString("utf8")}`;
 }
 
+/**
+ * Entrega de subagent-result (ID01-433, decisión congelada):
+ * agente vivo → "steer" (entra antes de la próxima llamada al LLM);
+ * idle → "nextTurn" (encolado al próximo prompt; NO dispara turno).
+ * `triggerTurn` está PROHIBIDO en v1 (turno SELF-CONTINUED en Zeron idle).
+ */
+export function chooseDeliverAs(agentLive: boolean): "steer" | "nextTurn" {
+	return agentLive ? "steer" : "nextTurn";
+}
+
+/** Formato congelado del mensaje subagent-result (SPEC-subagents-2). */
+export function formatSubagentResult(result: SubagentResult): string {
+	const secs = (result.durationMs / 1000).toFixed(1);
+	return `[subagent ${result.id} · ${result.role} · ${result.model} · ${secs}s · exit ${result.exitCode}]\n${result.output}`;
+}
+
 export interface SubagentTask {
 	id?: string;
 	role?: Role;
@@ -127,6 +149,39 @@ export interface SubagentResult {
 	durationMs: number;
 	output: string;
 }
+
+export interface DispatchedTask {
+	id: string;
+	role: Role;
+	model: string;
+}
+
+export interface RunningEntry {
+	id: string;
+	role: Role;
+	model: string;
+	startedAt: number;
+	killed: boolean;
+	/** Identidad del batch: el sweep de un dispatch no puede clavar un id reusado. */
+	batch: object;
+	/** false = en cola (cap 4); true = ya se llamó spawn. */
+	spawned: boolean;
+}
+
+export type CompletedState = "done" | "error" | "killed";
+
+export interface CompletedEntry {
+	id: string;
+	role: Role;
+	model: string;
+	state: CompletedState;
+	elapsed: number;
+	exitCode: number;
+	finishedAt: number;
+}
+
+/** Ring de los últimos N completados (SPEC-subagents-2: 20). */
+export const COMPLETED_RING_MAX = 20;
 
 export type SpawnFn = typeof spawn;
 
@@ -164,8 +219,22 @@ export function createSubagentsRuntime(deps: RuntimeDeps = {}) {
 	const baseEnv: NodeJS.ProcessEnv = deps.env ?? process.env;
 	const live = new Set<ChildProcess>();
 	const pendingKills = new Set<ReturnType<typeof setTimeout>>();
+	// Store por runtime — en la extensión hay UN runtime por proceso pi, así que
+	// sobrevive a cada llamada/dispatch (no por batch). NO sobrevive restart.
+	const running = new Map<string, RunningEntry>();
+	const completed: CompletedEntry[] = [];
+	// killAll incrementa: los workers de un batch viejo dejan de spawnar.
+	// Un batch NUEVO captura el epoch actual → no es sticky.
+	let killEpoch = 0;
+
+	const pushCompleted = (entry: CompletedEntry): void => {
+		completed.push(entry);
+		while (completed.length > COMPLETED_RING_MAX) completed.shift();
+	};
 
 	function killAll(): void {
+		killEpoch++;
+		for (const entry of running.values()) entry.killed = true;
 		for (const child of [...live]) {
 			try {
 				child.kill("SIGTERM");
@@ -180,6 +249,7 @@ export function createSubagentsRuntime(deps: RuntimeDeps = {}) {
 					/* ya muerto */
 				}
 			}, killGraceMs);
+			t.unref?.(); // no retener el event loop si el hijo ya murió por SIGTERM
 			pendingKills.add(t);
 		}
 	}
@@ -272,24 +342,8 @@ export function createSubagentsRuntime(deps: RuntimeDeps = {}) {
 			onUpdate?: (update: { content: Array<{ type: "text"; text: string }> }) => void;
 		},
 	): Promise<SubagentResult[]> {
-		if (!canSpawn(baseEnv)) {
-			throw new Error("subagents: PI_SUBAGENT_DEPTH >= 1 — un subagente no puede spawnear subagentes");
-		}
-		if (!Array.isArray(tasks) || tasks.length === 0) {
-			throw new Error("subagents: pasá al menos un task en tasks[]");
-		}
-		const resolved: ResolvedTask[] = tasks.map((t, i) => {
-			const role: Role = t.role ?? "grunt";
-			return {
-				id: t.id ?? `t${i + 1}`,
-				role,
-				route: resolveRoute(role, t.model, t.thinking),
-				prompt: t.prompt,
-				cwd: t.cwd,
-				timeoutMs: t.timeoutMs,
-			};
-		});
-		assertReviewerDistinct(resolved);
+		const resolved = resolveTasks(tasks);
+		const myEpoch = killEpoch;
 
 		let aborted = false;
 		const onAbort = () => {
@@ -304,6 +358,10 @@ export function createSubagentsRuntime(deps: RuntimeDeps = {}) {
 		const queue = resolved.map((task, index) => ({ task, index }));
 		const worker = async (): Promise<void> => {
 			while (queue.length > 0 && !aborted) {
+				if (killEpoch !== myEpoch) {
+					aborted = true;
+					break;
+				}
 				const next = queue.shift();
 				if (!next) break;
 				const r = await runTask(next.task);
@@ -327,7 +385,200 @@ export function createSubagentsRuntime(deps: RuntimeDeps = {}) {
 		return results.map((r) => r as SubagentResult);
 	}
 
-	return { runBatch, killAll };
+	/** Val idaciones compartidas foreground/background (antes de spawnear). */
+	function resolveTasks(tasks: SubagentTask[]): ResolvedTask[] {
+		if (!canSpawn(baseEnv)) {
+			throw new Error("subagents: PI_SUBAGENT_DEPTH >= 1 — un subagente no puede spawnear subagentes");
+		}
+		if (!Array.isArray(tasks) || tasks.length === 0) {
+			throw new Error("subagents: pasá al menos un task en tasks[]");
+		}
+		const resolved: ResolvedTask[] = tasks.map((t, i) => {
+			const role: Role = t.role ?? "grunt";
+			return {
+				id: t.id ?? `t${i + 1}`,
+				role,
+				route: resolveRoute(role, t.model, t.thinking),
+				prompt: t.prompt,
+				cwd: t.cwd,
+				timeoutMs: t.timeoutMs,
+			};
+		});
+		assertReviewerDistinct(resolved);
+		const seen = new Set<string>();
+		for (const t of resolved) {
+			if (seen.has(t.id)) {
+				throw new Error(`subagents: id "${t.id}" repetido en el batch`);
+			}
+			seen.add(t.id);
+		}
+		return resolved;
+	}
+
+	/**
+	 * Background (ID01-433): registra en `running`, arranca el mismo queue/cap 4
+	 * y retorna YA con los dispatched. Por cada task terminado: saca de running,
+	 * push al ring de completados y `onComplete(result)` (1 call por task, en
+	 * orden de completado). Un fallo/timeout NO tumba el resto. Ids colisionando
+	 * con `running` (o duplicados en el mismo batch) → batch rechazado entero.
+	 */
+	async function dispatchBackground(
+		tasks: SubagentTask[],
+		opts?: { onComplete?: (result: SubagentResult) => void; signal?: AbortSignal },
+	): Promise<DispatchedTask[]> {
+		if (opts?.signal?.aborted) {
+			throw new Error("subagents: signal abortado — no se despachó nada");
+		}
+		const resolved = resolveTasks(tasks);
+		for (const t of resolved) {
+			if (running.has(t.id)) {
+				throw new Error(`subagents: id "${t.id}" ya está running — rechazado el batch entero`);
+			}
+		}
+		const batch = {};
+		for (const t of resolved) {
+			running.set(t.id, {
+				id: t.id,
+				role: t.role,
+				model: modelKey(t.route),
+				startedAt: now(),
+				killed: false,
+				batch,
+				spawned: false,
+			});
+		}
+		const dispatched: DispatchedTask[] = resolved.map((t) => ({
+			id: t.id,
+			role: t.role,
+			model: modelKey(t.route),
+		}));
+
+		let aborted = false;
+		const onAbort = () => {
+			aborted = true;
+			killAll();
+		};
+		if (opts?.signal) {
+			// aborted-al-entrar ya se rechazó arriba; acá solo abortos mid-flight
+			opts.signal.addEventListener("abort", onAbort);
+		}
+
+		const finishTask = (r: SubagentResult, killed: boolean): void => {
+			running.delete(r.id);
+			const state: CompletedState = killed ? "killed" : r.exitCode === 0 ? "done" : "error";
+			pushCompleted({
+				id: r.id,
+				role: r.role,
+				model: r.model,
+				state,
+				elapsed: r.durationMs,
+				exitCode: r.exitCode,
+				finishedAt: now(),
+			});
+			// killed = sin result real → no onComplete (deliverResult no manda nada por él)
+			if (!killed) {
+				try {
+					opts?.onComplete?.(r);
+				} catch (err) {
+					// deliverResult/pi.sendMessage puede lanzar (p.ej. sesión en teardown).
+					// NO re-finalizar ni propagar: el catch del worker re-invocaría finishTask
+					// → doble entrada en completed + doble sendMessage; y sin .catch la IIFE
+					// crashearía el proceso pi con unhandledRejection.
+					console.error(`subagents: onComplete falló para ${r.id}:`, err instanceof Error ? err.message : err);
+				}
+			}
+		};
+
+		const queue = [...resolved];
+		const worker = async (): Promise<void> => {
+			while (queue.length > 0 && !aborted) {
+				const task = queue.shift();
+				if (!task) break;
+				const entry = running.get(task.id);
+				if (!entry) continue;
+				if (entry.killed) {
+					// killAll() lo marcó ANTES de spawnear (shutdown/abort con el task en cola)
+					running.delete(task.id);
+					pushCompleted({
+						id: task.id,
+						role: task.role,
+						model: entry.model,
+						state: "killed",
+						elapsed: Math.max(0, now() - entry.startedAt),
+						exitCode: -1,
+						finishedAt: now(),
+					});
+					continue;
+				}
+				try {
+					entry.spawned = true;
+					const r = await runTask(task);
+					// entry.killed pudo ponerse true durante el await (killAll)
+					finishTask(r, entry.killed);
+				} catch (err) {
+					// runTask no debería rechazar, pero un fallo NO tumba el resto
+					finishTask(
+						{
+							id: task.id,
+							role: task.role,
+							model: modelKey(task.route),
+							exitCode: -1,
+							durationMs: Math.max(0, now() - entry.startedAt),
+							output: `subagents: spawn error: ${err instanceof Error ? err.message : String(err)}`,
+						},
+						entry.killed,
+					);
+				}
+			}
+		};
+
+		// Fire-and-forget: el caller NUNCA espera a los hijos (cero polling).
+		(async () => {
+			try {
+				await Promise.all(Array.from({ length: Math.min(concurrency, resolved.length) }, worker));
+			} finally {
+				opts?.signal?.removeEventListener("abort", onAbort);
+				// Sweep de seguridad: tasks que quedaron en running sin finalizar
+				// (workers cortados por abort antes de agotar la cola).
+				for (const t of resolved) {
+					const entry = running.get(t.id);
+					if (!entry || entry.batch !== batch) continue;
+					running.delete(t.id);
+					pushCompleted({
+						id: t.id,
+						role: t.role,
+						model: entry.model,
+						state: "killed",
+						elapsed: Math.max(0, now() - entry.startedAt),
+						exitCode: -1,
+						finishedAt: now(),
+					});
+				}
+			}
+		})().catch(() => {
+			// los workers ya tragan todo; esto evita unhandledRejection si algo escapa
+		});
+		return dispatched;
+	}
+
+	/** Snapshot sin bloquear: running + últimos completados (más reciente último). */
+	function status(): {
+		running: Array<{ id: string; state: "queued" | "running"; elapsed: number; role: Role; model: string }>;
+		completed: CompletedEntry[];
+	} {
+		return {
+			running: [...running.values()].map((e) => ({
+				id: e.id,
+				state: (e.spawned ? "running" : "queued") as "queued" | "running",
+				elapsed: Math.max(0, now() - e.startedAt),
+				role: e.role,
+				model: e.model,
+			})),
+			completed: completed.slice(),
+		};
+	}
+
+	return { runBatch, dispatchBackground, status, killAll };
 }
 
 const RoleSchema = Type.Union([
@@ -345,8 +596,26 @@ const ThinkingSchema = Type.Union([
 	Type.Literal("xhigh"),
 ]);
 
-export default function (pi: ExtensionAPI): void {
-	const runtime = createSubagentsRuntime();
+/** Wiring testeable: inyectá runtime (spawn/now) y un `pi` mock. */
+export function installSubagents(pi: ExtensionAPI, runtime = createSubagentsRuntime()): void {
+	let agentLive = false; // agent_start → true, agent_settled → false (no agent_end: hay retries/compaction)
+	let shutdown = false;
+
+	pi.on("agent_start", () => {
+		agentLive = true;
+	});
+	pi.on("agent_settled", () => {
+		agentLive = false;
+	});
+
+	/** Entrega un resultado como subagent-result (1 sendMessage por task, sin concatenar). */
+	const deliverResult = (result: SubagentResult): void => {
+		if (shutdown) return; // tras session_shutdown no mandamos sendMessage
+		pi.sendMessage(
+			{ customType: "subagent-result", content: formatSubagentResult(result), display: true, details: result },
+			{ deliverAs: chooseDeliverAs(agentLive) }, // jamás triggerTurn
+		);
+	};
 
 	pi.registerTool({
 		name: "subagents",
@@ -354,10 +623,13 @@ export default function (pi: ExtensionAPI): void {
 		description:
 			"Despacha N subagentes pi en paralelo (foreground: espera a todos y devuelve resultados). " +
 			"Roles: research/grunt→qwen3.8-max low · implement→glm-5.3 medium · review→k3 high · hard→deepseek-v4-pro medium. " +
+			"background:true retorna YA con dispatched y los resultados llegan solos como mensajes subagent-result " +
+			"(consultá subagents_status). " +
 			"Usala para subtareas INDEPENDIENTES en paralelo; dependientes van secuencial. Devuelve por task: {id, role, model, exitCode, durationMs, output}.",
 		promptSnippet: "Despachar subagentes pi paralelos por rol (research/implement/review/hard/grunt)",
 		promptGuidelines: [
 			"Usá subagents para subtareas independientes en paralelo en lugar de múltiples bash con `pi … &`; los prompts deben ser auto-contenidos y deterministas.",
+			"Con background:true no esperes con sleeps: los resultados llegan como subagent-result; chequeá subagents_status si necesitás el estado.",
 		],
 		parameters: Type.Object({
 			tasks: Type.Array(
@@ -372,8 +644,22 @@ export default function (pi: ExtensionAPI): void {
 				}),
 				{ minItems: 1 },
 			),
+			background: Type.Optional(
+				Type.Boolean({
+					description:
+						"si true, retorna YA con {dispatched, note}; los resultados llegan como mensajes subagent-result (default false: foreground)",
+				}),
+			),
 		}),
 		async execute(_toolCallId, params, signal, onUpdate) {
+			if (params.background) {
+				const dispatched = await runtime.dispatchBackground(params.tasks, {
+					signal,
+					onComplete: deliverResult,
+				});
+				const payload = { dispatched, note: "los resultados llegan como subagent-result" };
+				return { content: [{ type: "text", text: JSON.stringify(payload) }], details: { dispatched } };
+			}
 			const results = await runtime.runBatch(params.tasks, { signal, onUpdate });
 			return {
 				content: [{ type: "text", text: JSON.stringify(results) }],
@@ -382,7 +668,24 @@ export default function (pi: ExtensionAPI): void {
 		},
 	});
 
-	pi.on("session_shutdown", async () => {
-		runtime.killAll();
+	pi.registerTool({
+		name: "subagents_status",
+		label: "Subagents status",
+		description: "Lista subagentes background running + últimos completados. No bloquea.",
+		promptSnippet: "Estado de subagentes background (running + completados)",
+		parameters: Type.Object({}),
+		async execute() {
+			const s = runtime.status();
+			return { content: [{ type: "text", text: JSON.stringify(s) }], details: s };
+		},
 	});
+
+	pi.on("session_shutdown", async () => {
+		shutdown = true; // corta deliverResult ANTES de matar
+		runtime.killAll(); // foreground + background; los running pasan a completed con state "killed"
+	});
+}
+
+export default function (pi: ExtensionAPI): void {
+	installSubagents(pi);
 }

@@ -1,5 +1,5 @@
 /**
- * Unit tests — subagents (ID01-432, SPEC-subagents-1).
+ * Unit tests — subagents (ID01-432 + ID01-433, SPEC-subagents-1/2).
  * Sin framework: `node tooling/pi-extensions/subagents.test.mjs`
  * E2E (caro/quota, NO gate): `SUBAGENTS_E2E=1 node tooling/pi-extensions/subagents.test.mjs`
  */
@@ -10,7 +10,7 @@ import * as url from "node:url";
 
 const here = import.meta.dirname;
 const mod = await import(url.pathToFileURL(path.join(here, "subagents.ts")).href);
-const { resolveRoute, canSpawn, assertReviewerDistinct, trimTail, createSubagentsRuntime, ROUTES, modelKey } = mod;
+const { resolveRoute, canSpawn, assertReviewerDistinct, trimTail, createSubagentsRuntime, ROUTES, modelKey, chooseDeliverAs, formatSubagentResult, installSubagents } = mod;
 
 let passed = 0;
 const failures = [];
@@ -239,6 +239,367 @@ await test("signal abort → mata todo y el batch falla", async () => {
 	await tick();
 	ac.abort();
 	await assert.rejects(() => batch, /abortado/);
+});
+
+// ---------- ID01-433: background + status ----------
+await test("background: dispatch resuelve YA sin esperar exit de los procs", async () => {
+	const fake = makeFakeSpawn();
+	const rt = createSubagentsRuntime({ spawnFn: fake.spawnFn });
+	const dispatched = await rt.dispatchBackground([{ id: "t1", role: "research", prompt: "x" }]);
+	assert.deepEqual(dispatched, [{ id: "t1", role: "research", model: "alibaba/qwen3.8-max" }]);
+	assert.equal(fake.spawned, 1);
+	assert.equal(fake.procs[0].exited, false, "el proc sigue vivo cuando dispatch ya resolvió");
+	fake.finishProc(fake.procs[0], 0);
+	await tick();
+	assert.equal(rt.status().completed.length, 1);
+});
+
+await test("onComplete: 1 call por task, en orden de completado (t2 antes que t1)", async () => {
+	const fake = makeFakeSpawn();
+	const rt = createSubagentsRuntime({ spawnFn: fake.spawnFn });
+	const calls = [];
+	const done = new Promise((resolve) => {
+		let n = 0;
+		rt.dispatchBackground(
+			[
+				{ id: "t1", prompt: "a" },
+			{ id: "t2", prompt: "b" },
+			],
+			{
+				onComplete: (r) => {
+					calls.push(r.id);
+					if (++n === 2) resolve();
+				},
+			},
+		);
+	});
+	await tick();
+	assert.equal(fake.spawned, 2, "ambos corriendo en paralelo (cap 4)");
+	fake.finishProc(fake.procs[1], 0, null, "b"); // t2 termina primero
+	fake.finishProc(fake.procs[0], 0, null, "a");
+	await done;
+	assert.deepEqual(calls, ["t2", "t1"], "orden de completado, no de dispatch");
+});
+
+await test("chooseDeliverAs: agente vivo → steer, idle → nextTurn", () => {
+	assert.equal(chooseDeliverAs(true), "steer");
+	assert.equal(chooseDeliverAs(false), "nextTurn");
+});
+
+await test("formatSubagentResult: formato congelado del spec", () => {
+	assert.equal(
+		formatSubagentResult({ id: "t1", role: "review", model: "kimi-coding/k3", exitCode: 0, durationMs: 1234, output: "hola" }),
+		"[subagent t1 · review · kimi-coding/k3 · 1.2s · exit 0]\nhola",
+	);
+});
+
+await test("status: running con elapsed ≥ 0 → done con exitCode presente", async () => {
+	const fake = makeFakeSpawn();
+	const rt = createSubagentsRuntime({ spawnFn: fake.spawnFn });
+	rt.dispatchBackground([{ id: "s1", role: "grunt", prompt: "x" }]);
+	await tick();
+	let s = rt.status();
+	assert.equal(s.running.length, 1);
+	assert.equal(s.running[0].id, "s1");
+	assert.equal(s.running[0].state, "running");
+	assert.equal(s.running[0].model, "alibaba/qwen3.8-max");
+	assert.ok(s.running[0].elapsed >= 0);
+	assert.equal(s.completed.length, 0);
+	fake.finishProc(fake.procs[0], 0);
+	await tick();
+	s = rt.status();
+	assert.equal(s.running.length, 0);
+	assert.equal(s.completed.length, 1);
+	assert.equal(s.completed[0].state, "done");
+	assert.equal(s.completed[0].exitCode, 0);
+	assert.ok(s.completed[0].elapsed >= 0);
+	assert.ok(Number.isFinite(s.completed[0].finishedAt));
+});
+
+await test("ráfaga: 3 completes → 3 onComplete separados (nunca 1 concatenada)", async () => {
+	const fake = makeFakeSpawn();
+	const rt = createSubagentsRuntime({ spawnFn: fake.spawnFn });
+	const calls = [];
+	const done = new Promise((resolve) => {
+		let n = 0;
+		rt.dispatchBackground(
+			[
+				{ id: "a", prompt: "1" },
+			{ id: "b", prompt: "2" },
+			{ id: "c", prompt: "3" },
+			],
+			{
+				onComplete: (r) => {
+					calls.push(r.id);
+					if (++n === 3) resolve();
+				},
+			},
+		);
+	});
+	await tick();
+	fake.procs.forEach((p, i) => fake.finishProc(p, i === 1 ? 1 : 0));
+	await done;
+	assert.equal(calls.length, 3);
+	assert.deepEqual([...calls].sort(), ["a", "b", "c"]);
+	assert.equal(rt.status().completed.find((c) => c.id === "b").state, "error");
+	assert.equal(rt.status().completed.filter((c) => c.state === "done").length, 2);
+});
+
+await test("killAll con background vivo → completed state killed, no queda en running", async () => {
+	const fake = makeFakeSpawn();
+	const rt = createSubagentsRuntime({ spawnFn: fake.spawnFn, killGraceMs: 1 });
+	rt.dispatchBackground([
+		{ id: "k1", prompt: "x" },
+		{ id: "k2", prompt: "y" },
+	]);
+	await tick();
+	rt.killAll();
+	await tick(10);
+	const s = rt.status();
+	assert.equal(s.running.length, 0);
+	assert.equal(s.completed.length, 2);
+	assert.ok(s.completed.every((c) => c.state === "killed"), JSON.stringify(s.completed));
+});
+
+await test("killAll no es sticky: un batch nuevo después puede completar done", async () => {
+	const fake = makeFakeSpawn();
+	const rt = createSubagentsRuntime({ spawnFn: fake.spawnFn, killGraceMs: 1 });
+	rt.dispatchBackground([{ id: "t1", prompt: "old" }]);
+	await tick();
+	rt.killAll();
+	await tick(10);
+	assert.equal(rt.status().running.length, 0);
+	// reusa el mismo id: el sweep del batch viejo no lo puede marcar killed
+	const calls = [];
+	const done = new Promise((resolve) => {
+		rt.dispatchBackground([{ id: "t1", prompt: "new" }], {
+			onComplete: (r) => {
+				calls.push(r.id);
+				resolve();
+			},
+		});
+	});
+	await tick();
+	const neu = fake.procs.find((p) => !p.exited);
+	assert.ok(neu, "el batch nuevo tiene que haber spawnado");
+	fake.finishProc(neu, 0);
+	await done;
+	const last = rt.status().completed.at(-1);
+	assert.equal(last.id, "t1");
+	assert.equal(last.state, "done", JSON.stringify(rt.status().completed));
+	assert.deepEqual(calls, ["t1"]);
+});
+
+await test("onComplete que lanza no duplica el completed ni tumba el runtime", async () => {
+	const fake = makeFakeSpawn();
+	const rt = createSubagentsRuntime({ spawnFn: fake.spawnFn });
+	let calls = 0;
+	rt.dispatchBackground([{ id: "x", prompt: "p" }], {
+		onComplete: () => {
+			calls++;
+			throw new Error("boom deliverResult");
+		},
+	});
+	await tick();
+	fake.finishProc(fake.procs[0], 0);
+	await tick(20);
+	assert.equal(calls, 1, "onComplete se llamó una sola vez (aunque lanzó)");
+	assert.equal(rt.status().completed.length, 1, "sin entrada duplicada en completed");
+	assert.equal(rt.status().completed[0].state, "done");
+});
+
+await test("killAll con viejo que cuelga en SIGTERM + reuso de id → nuevo queda done", async () => {
+	const fake = makeFakeSpawn({ hangOnTerm: true });
+	const rt = createSubagentsRuntime({ spawnFn: fake.spawnFn, killGraceMs: 5 });
+	rt.dispatchBackground([{ id: "t1", prompt: "old" }]);
+	await tick();
+	rt.killAll(); // SIGTERM ignorado; SIGKILL llega en ~5ms
+	await tick(30); // SIGKILL dispara → viejo finaliza killed; sweep ya corrió
+	assert.equal(rt.status().running.length, 0);
+	const calls = [];
+	const done = new Promise((resolve) => {
+		rt.dispatchBackground([{ id: "t1", prompt: "new" }], {
+			onComplete: (r) => {
+				calls.push(r.id);
+				resolve();
+			},
+		});
+	});
+	await tick();
+	const neu = fake.procs.find((p) => !p.exited);
+	assert.ok(neu, "el batch nuevo tiene que haber spawnado");
+	fake.finishProc(neu, 0);
+	await done;
+	const completed = rt.status().completed;
+	assert.ok(completed.some((c) => c.id === "t1" && c.state === "killed"), "viejo quedó killed");
+	assert.ok(completed.some((c) => c.id === "t1" && c.state === "done"), "nuevo quedó done");
+	assert.deepEqual(calls, ["t1"]);
+});
+
+await test("id ya en running → rechaza el batch entero, 0 spawn extra", async () => {
+	const fake = makeFakeSpawn();
+	const rt = createSubagentsRuntime({ spawnFn: fake.spawnFn });
+	await rt.dispatchBackground([{ id: "dup", prompt: "x" }]);
+	assert.equal(fake.spawned, 1);
+	await assert.rejects(
+		() => rt.dispatchBackground([{ id: "dup", prompt: "y" }, { id: "otro", prompt: "z" }]),
+		/ya está running/,
+	);
+	assert.equal(fake.spawned, 1, "ni \"otro\" spawnó: batch rechazado entero");
+	assert.equal(rt.status().running.length, 1);
+	// limpieza para no dejar timers vivos
+	fake.finishProc(fake.procs[0], 0);
+	await tick();
+});
+
+await test("background valida igual que foreground: depth, review=implement, ≥1 task", async () => {
+	const fakeDepth = makeFakeSpawn();
+	const rtDepth = createSubagentsRuntime({ spawnFn: fakeDepth.spawnFn, env: { PI_SUBAGENT_DEPTH: "1" } });
+	await assert.rejects(() => rtDepth.dispatchBackground([{ prompt: "x" }]), /PI_SUBAGENT_DEPTH/);
+	assert.equal(fakeDepth.spawned, 0);
+
+	const fake = makeFakeSpawn();
+	const rt = createSubagentsRuntime({ spawnFn: fake.spawnFn });
+	await assert.rejects(
+		() =>
+			rt.dispatchBackground([
+				{ role: "implement", prompt: "x", model: "zai/glm-5.3" },
+			{ role: "review", prompt: "y", model: "zai/glm-5.3" },
+			]),
+		/mismo modelo/,
+	);
+	assert.equal(fake.spawned, 0);
+	await assert.rejects(() => rt.dispatchBackground([]), /al menos un task/);
+});
+
+await test("foreground: ids duplicados en el batch se rechazan antes de spawn", async () => {
+	const fake = makeFakeSpawn();
+	const rt = createSubagentsRuntime({ spawnFn: fake.spawnFn });
+	await assert.rejects(
+		() => rt.runBatch([{ id: "t2", prompt: "a" }, { prompt: "b" }, { prompt: "c" }]),
+		/repetido en el batch/,
+	);
+	assert.equal(fake.spawned, 0);
+});
+
+await test("killAll frena cola foreground: no spawn extra post-shutdown", async () => {
+	const fake = makeFakeSpawn();
+	const rt = createSubagentsRuntime({ spawnFn: fake.spawnFn, concurrency: 2, killGraceMs: 1 });
+	const tasks = Array.from({ length: 6 }, (_, i) => ({ id: `f${i + 1}`, prompt: `p${i}` }));
+	const batch = rt.runBatch(tasks);
+	const rejected = assert.rejects(() => batch, /abortado/);
+	await tick();
+	assert.equal(fake.spawned, 2);
+	rt.killAll();
+	await rejected;
+	assert.equal(fake.spawned, 2, "no se spawnan los 4 que quedaban en cola");
+});
+
+await test("background: signal ya abortado → reject, 0 spawn, 0 running", async () => {
+	const fake = makeFakeSpawn();
+	const rt = createSubagentsRuntime({ spawnFn: fake.spawnFn });
+	const ac = new AbortController();
+	ac.abort();
+	await assert.rejects(
+		() => rt.dispatchBackground([{ id: "x", prompt: "no" }], { signal: ac.signal }),
+		/signal abortado/,
+	);
+	assert.equal(fake.spawned, 0);
+	assert.equal(rt.status().running.length, 0);
+	assert.equal(rt.status().completed.length, 0);
+});
+
+await test("status: cap 1 → 1 running + 1 queued", async () => {
+	const fake = makeFakeSpawn();
+	const rt = createSubagentsRuntime({ spawnFn: fake.spawnFn, concurrency: 1 });
+	rt.dispatchBackground([
+		{ id: "a", prompt: "1" },
+		{ id: "b", prompt: "2" },
+	]);
+	await tick();
+	const s = rt.status();
+	assert.equal(s.running.length, 2);
+	assert.equal(s.running.find((r) => r.id === "a").state, "running");
+	assert.equal(s.running.find((r) => r.id === "b").state, "queued");
+	fake.finishProc(fake.procs[0], 0);
+	await tick();
+	const s2 = rt.status();
+	assert.equal(s2.running.find((r) => r.id === "b")?.state, "running");
+	fake.finishProc(fake.procs[1], 0);
+	await tick();
+});
+
+function makeFakePi() {
+	const tools = {};
+	const handlers = {};
+	const sent = [];
+	const pi = {
+		on(ev, fn) {
+			handlers[ev] = fn;
+		},
+		registerTool(t) {
+			tools[t.name] = t;
+		},
+		sendMessage(msg, opts) {
+			sent.push({ msg, opts });
+		},
+	};
+	return { pi, tools, handlers, sent };
+}
+
+await test("installSubagents: steer si live, nextTurn si idle, nada post-shutdown", async () => {
+	const fake = makeFakeSpawn();
+	const rt = createSubagentsRuntime({ spawnFn: fake.spawnFn });
+	const { pi, tools, handlers, sent } = makeFakePi();
+	installSubagents(pi, rt);
+	assert.ok(tools.subagents);
+	assert.ok(tools.subagents_status);
+
+	handlers.agent_start();
+	const live = tools.subagents.execute(
+		"tc1",
+		{ background: true, tasks: [{ id: "live1", prompt: "x" }] },
+		undefined,
+		undefined,
+	);
+	await tick();
+	fake.finishProc(fake.procs[0], 0, null, "out-live");
+	await tick();
+	await live;
+	assert.equal(sent.length, 1);
+	assert.equal(sent[0].opts.deliverAs, "steer");
+	assert.equal(sent[0].opts.triggerTurn, undefined);
+	assert.equal(sent[0].msg.customType, "subagent-result");
+	assert.equal(sent[0].msg.display, true);
+	assert.match(sent[0].msg.content, /subagent live1/);
+
+	handlers.agent_settled();
+	const idle = tools.subagents.execute(
+		"tc2",
+		{ background: true, tasks: [{ id: "idle1", prompt: "y" }] },
+		undefined,
+		undefined,
+	);
+	await tick();
+	fake.finishProc(fake.procs[1], 0, null, "out-idle");
+	await tick();
+	await idle;
+	assert.equal(sent.length, 2);
+	assert.equal(sent[1].opts.deliverAs, "nextTurn");
+
+	handlers.session_shutdown();
+	const after = tools.subagents.execute(
+		"tc3",
+		{ background: true, tasks: [{ id: "dead1", prompt: "z" }] },
+		undefined,
+		undefined,
+	);
+	await tick();
+	const leftover = fake.procs.find((p) => !p.exited);
+	if (leftover) fake.finishProc(leftover, 0);
+	await tick();
+	await after.catch(() => {});
+	assert.equal(sent.length, 2, "post-shutdown no manda sendMessage");
 });
 
 // ---------- E2E (opt-in) ----------
