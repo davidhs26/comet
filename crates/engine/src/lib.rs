@@ -754,6 +754,15 @@ impl Engine {
         // never waits on — or dies inside — an npm run.
         zeron_harness::acp::prewarm_managed_adapters();
 
+        // Deaf-socket escalation: when the registry room's presence tripwire
+        // redials, probe every open chat room too — they ride the same relay
+        // and a deaf chat room silently stops delivering transcripts to
+        // remote devices (a probe is free on a healthy room; a deaf one
+        // misses its deadline and redials itself).
+        let docs_for_deaf = core.doc_host.clone();
+        core.workspace
+            .set_deaf_escalation_hook(Arc::new(move || docs_for_deaf.probe_open_chats()));
+
         let host_relay = edge.as_ref().map(|edge| {
             let links = zeron_rpc::LinkCache::new(zeron_rpc::LinkCacheConfig::new(
                 edge.url.clone(),
