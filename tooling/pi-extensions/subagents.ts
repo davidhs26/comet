@@ -14,9 +14,17 @@
  * - Copia versionada: /home/david/comet/tooling/pi-extensions/subagents.ts
  * - Copia runtime:    ~/.pi/agent/extensions/subagents.ts (mismos bytes)
  *
+ * Background NO es durable: el store vive en el proceso pi, no sobrevive restart.
+ *
+ * v3 (ID01-434): usage/costo por task (jsonl de la sesión del hijo en dir
+ * descartable; fallback chars), envelope foreground {results, summary, payg},
+ * presupuesto PI_SUBAGENTS_MAX_COST_USD (tasks NUEVOS no se despachan; los
+ * vivos terminan) y status().totals (best-effort, ring de 20).
+ *
  * No toca el engine.
  */
 import { spawn, type ChildProcess } from "node:child_process";
+import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -28,6 +36,8 @@ export const KILL_GRACE_MS = 10_000; // SIGTERM → +10s → SIGKILL
 export const OUTPUT_CAP_BYTES = 8 * 1024;
 /** Convención `timeout(1)`: exitCode reportado cuando un task muere por timeout. */
 export const TIMEOUT_EXIT_CODE = 124;
+/** Convención "no corrido": task NO despachado por presupuesto (ID01-434). */
+export const BUDGET_SKIP_EXIT_CODE = 125;
 
 export type Role = "research" | "implement" | "review" | "hard" | "grunt";
 export type ThinkingLevel = "minimal" | "low" | "medium" | "high" | "xhigh";
@@ -124,10 +134,178 @@ export function chooseDeliverAs(agentLive: boolean): "steer" | "nextTurn" {
 	return agentLive ? "steer" : "nextTurn";
 }
 
-/** Formato congelado del mensaje subagent-result (SPEC-subagents-2). */
+// ---------- ID01-434: usage/costo + presupuesto ----------
+
+export interface TaskUsage {
+	input: number;
+	output: number;
+	cacheRead: number;
+	/** Solo si algún entry trajo cost.total; si NINGUNO, se OMITE (no 0 mintiendo). */
+	costUsd?: number;
+	/** Solo fallback (sin jsonl/usage): chars del output. */
+	chars?: number;
+}
+
+interface UsageRaw {
+	input?: unknown;
+	output?: unknown;
+	cacheRead?: unknown;
+	cost?: { total?: unknown } | undefined;
+}
+
+/** Suma usages; `costUsd` solo si ALGUNA part lo trae. `chars` no se propaga. */
+export function sumUsage(parts: TaskUsage[]): TaskUsage {
+	const total: TaskUsage = { input: 0, output: 0, cacheRead: 0 };
+	let cost = 0;
+	let hasCost = false;
+	for (const p of parts) {
+		// defensivo: parts parciales (p.ej. fallback solo chars) no generan NaN
+		total.input += num(p.input);
+		total.output += num(p.output);
+		total.cacheRead += num(p.cacheRead);
+		if (typeof p.costUsd === "number") {
+			hasCost = true;
+			cost += p.costUsd;
+		}
+	}
+	if (hasCost) total.costUsd = cost;
+	return total;
+}
+
+const num = (v: unknown): number => {
+	const n = Number(v);
+	return Number.isFinite(n) ? n : 0;
+};
+
+function usageFromRaw(raw: UsageRaw | undefined | null): TaskUsage | undefined {
+	if (!raw || typeof raw !== "object") return undefined;
+	const u: TaskUsage = { input: num(raw.input), output: num(raw.output), cacheRead: num(raw.cacheRead) };
+	if (raw.cost && typeof raw.cost.total === "number") u.costUsd = raw.cost.total;
+	return u;
+}
+
+/**
+ * Suma el usage de un session jsonl de pi (docs/session-format.md):
+ * message.role assistant|toolResult → message.usage; type compaction → usage.
+ * Líneas ilegibles se ignoran. Sin entries con usage → {0,0,0} sin costUsd.
+ */
+export function usageFromSessionJsonl(text: string): TaskUsage {
+	const parts: TaskUsage[] = [];
+	for (const line of text.split("\n")) {
+		const trimmed = line.trim();
+		if (!trimmed) continue;
+		let entry: unknown;
+		try {
+			entry = JSON.parse(trimmed);
+		} catch {
+			continue; // línea trunca/ruidosa
+		}
+		if (!entry || typeof entry !== "object") continue;
+		const e = entry as { type?: unknown; message?: { role?: unknown; usage?: UsageRaw } };
+		if (e.message?.role === "assistant" || e.message?.role === "toolResult") {
+			const u = usageFromRaw(e.message.usage);
+			if (u) parts.push(u);
+		} else if (e.type === "compaction") {
+			const u = usageFromRaw((e as { usage?: UsageRaw }).usage);
+			if (u) parts.push(u);
+		}
+	}
+	return sumUsage(parts);
+}
+
+/**
+ * Default readSessionUsage: walk del dir de sesión buscando *.jsonl
+ * (pi guarda sessionDir/--<cwd>--/*.jsonl). Dir ilegible/inexistente o jsonl
+ * sin usage → undefined (el caller aplica el fallback chars).
+ */
+function readSessionUsageFromDir(dir: string): TaskUsage | undefined {
+	const texts: string[] = [];
+	const walk = (d: string): void => {
+		let entries: fs.Dirent[];
+		try {
+			entries = fs.readdirSync(d, { withFileTypes: true });
+		} catch {
+			return;
+		}
+		for (const e of entries) {
+			const p = path.join(d, e.name);
+			if (e.isDirectory()) walk(p);
+			else if (e.isFile() && e.name.endsWith(".jsonl")) {
+				try {
+					texts.push(fs.readFileSync(p, "utf8"));
+				} catch {
+					/* ilegible → ignorar */
+				}
+			}
+		}
+	};
+	walk(dir);
+	const parts = texts.flatMap((t) => {
+		const u = usageFromSessionJsonl(t);
+		// {0,0,0} sin costUsd = archivo sin usage real → no cuenta
+		return u.input === 0 && u.output === 0 && u.cacheRead === 0 && u.costUsd === undefined ? [] : [u];
+	});
+	if (parts.length === 0) return undefined;
+	return sumUsage(parts);
+}
+
+/** Ids de task van a path.join(sessionRoot, batchKey, id). Rechazar traversal. */
+export const TASK_ID_RE = /^[A-Za-z0-9._-]+$/;
+export function assertSafeTaskId(id: string): void {
+	if (!TASK_ID_RE.test(id) || id === "." || id === "..") {
+		throw new Error(`subagents: id "${id}" inválido (solo [A-Za-z0-9._-]+)`);
+	}
+}
+
+/** Tope de costo del batch: ausente / "" / NaN / <0 → undefined (sin tope). */
+export function parseMaxCostUsd(env: NodeJS.ProcessEnv): number | undefined {
+	const raw = env.PI_SUBAGENTS_MAX_COST_USD;
+	if (raw === undefined || raw === "") return undefined;
+	const n = Number(raw);
+	if (!Number.isFinite(n) || n < 0) return undefined;
+	return n;
+}
+
+/**
+ * Línea-resumen del batch (SPEC-subagents-3):
+ * "4 tasks · 12.3s wall · 30.1s cpu · ~$0.31 total" · [" · incluye PAYG"] · [" · N skipped (presupuesto)"]
+ */
+export function formatBatchSummary(opts: {
+	n: number;
+	wallMs: number;
+	sumMs: number;
+	costUsd?: number;
+	payg: boolean;
+	skipped?: number;
+}): string {
+	let s = `${opts.n} tasks · ${(opts.wallMs / 1000).toFixed(1)}s wall · ${(opts.sumMs / 1000).toFixed(1)}s cpu`;
+	s += opts.costUsd !== undefined ? ` · ~$${opts.costUsd.toFixed(2)} total` : " · cost n/d";
+	if (opts.payg) s += " · incluye PAYG";
+	if (opts.skipped !== undefined && opts.skipped > 0) s += ` · ${opts.skipped} skipped (presupuesto)`;
+	return s;
+}
+
+/** PAYG del batch: algún task con role "hard" o provider resuelto deepseek-payg. */
+export function batchPayg(tasks: SubagentTask[]): boolean {
+	return tasks.some((t) => {
+		if (t.role === "hard") return true;
+		try {
+			return resolveRoute(t.role ?? "grunt", t.model, t.thinking).provider === "deepseek-payg";
+		} catch {
+			return false; // input inválido: resolveTasks ya lo rechazó antes de llegar acá
+		}
+	});
+}
+
+/** `~$0.01` si hay costUsd; `cost n/d` si no (nunca un 0 mintiendo). */
+export function usageCostBit(usage?: TaskUsage): string {
+	return typeof usage?.costUsd === "number" ? `~$${usage.costUsd.toFixed(2)}` : "cost n/d";
+}
+
+/** Formato congelado del mensaje subagent-result (SPEC-subagents-2/3). */
 export function formatSubagentResult(result: SubagentResult): string {
 	const secs = (result.durationMs / 1000).toFixed(1);
-	return `[subagent ${result.id} · ${result.role} · ${result.model} · ${secs}s · exit ${result.exitCode}]\n${result.output}`;
+	return `[subagent ${result.id} · ${result.role} · ${result.model} · ${secs}s · exit ${result.exitCode} · ${usageCostBit(result.usage)}]\n${result.output}`;
 }
 
 export interface SubagentTask {
@@ -148,6 +326,9 @@ export interface SubagentResult {
 	exitCode: number;
 	durationMs: number;
 	output: string;
+	usage: TaskUsage;
+	/** Task NO despachado por presupuesto: exitCode 125, durationMs 0 (ID01-434). */
+	skipped?: "budget";
 }
 
 export interface DispatchedTask {
@@ -168,7 +349,7 @@ export interface RunningEntry {
 	spawned: boolean;
 }
 
-export type CompletedState = "done" | "error" | "killed";
+export type CompletedState = "done" | "error" | "killed" | "skipped";
 
 export interface CompletedEntry {
 	id: string;
@@ -178,6 +359,9 @@ export interface CompletedEntry {
 	elapsed: number;
 	exitCode: number;
 	finishedAt: number;
+	usage?: TaskUsage;
+	/** true si el task era role hard / provider deepseek-payg. */
+	payg?: boolean;
 }
 
 /** Ring de los últimos N completados (SPEC-subagents-2: 20). */
@@ -193,6 +377,14 @@ export interface RuntimeDeps {
 	piBin?: string;
 	cwdDefault?: string;
 	env?: NodeJS.ProcessEnv;
+	/** ID01-434: raíz de sesiones de los hijos (default os.tmpdir()/pi-subagents). */
+	sessionRoot?: string;
+	/** Lee usage del dir de sesión del hijo; undefined → fallback chars. */
+	readSessionUsage?: (dir: string) => TaskUsage | undefined;
+	/** Borra el dir de sesión (corre SIEMPRE: exit/timeout/kill/error). */
+	rmSessionDir?: (dir: string) => void;
+	/** Crea el dir de sesión antes del spawn. */
+	mkdirSessionDir?: (dir: string) => void;
 }
 
 interface ResolvedTask {
@@ -217,6 +409,21 @@ export function createSubagentsRuntime(deps: RuntimeDeps = {}) {
 	const killGraceMs: number = deps.killGraceMs ?? KILL_GRACE_MS;
 	const piBin: string = deps.piBin ?? defaultPiBin();
 	const baseEnv: NodeJS.ProcessEnv = deps.env ?? process.env;
+	const sessionRoot: string = deps.sessionRoot ?? path.join(os.tmpdir(), "pi-subagents");
+	const readSessionUsage: (dir: string) => TaskUsage | undefined =
+		deps.readSessionUsage ?? readSessionUsageFromDir;
+	const rmSessionDir: (dir: string) => void = deps.rmSessionDir ?? ((d) => fs.rmSync(d, { recursive: true, force: true }));
+	const mkdirSessionDir: (dir: string) => void = deps.mkdirSessionDir ?? ((d) => fs.mkdirSync(d, { recursive: true }));
+	// batchKey: pid + now + counter — dos procesos pi no pueden colisionar el mismo dir.
+	let batchCounter = 0;
+	const nextBatchKey = (): string => `${process.pid}-${now()}-${++batchCounter}`;
+	const cleanupBatchDir = (batchKey: string): void => {
+		try {
+			rmSessionDir(path.join(sessionRoot, batchKey));
+		} catch {
+			/* ya borrado / ENOENT */
+		}
+	};
 	const live = new Set<ChildProcess>();
 	const pendingKills = new Set<ReturnType<typeof setTimeout>>();
 	// Store por runtime — en la extensión hay UN runtime por proceso pi, así que
@@ -230,6 +437,27 @@ export function createSubagentsRuntime(deps: RuntimeDeps = {}) {
 	const pushCompleted = (entry: CompletedEntry): void => {
 		completed.push(entry);
 		while (completed.length > COMPLETED_RING_MAX) completed.shift();
+	};
+
+	const resultPayg = (r: SubagentResult): boolean =>
+		r.role === "hard" || r.model.split("/")[0] === "deepseek-payg";
+
+	/** Result de task NO despachado por presupuesto (los vivos terminan). */
+	const budgetSkipResult = (task: ResolvedTask, max: number, accumulated: number): SubagentResult => ({
+		id: task.id,
+		role: task.role,
+		model: modelKey(task.route),
+		exitCode: BUDGET_SKIP_EXIT_CODE,
+		durationMs: 0,
+		output: `subagents: no despachado — presupuesto PI_SUBAGENTS_MAX_COST_USD excedido (acumulado $${accumulated.toFixed(2)} >= $${max.toFixed(2)})`,
+		usage: { input: 0, output: 0, cacheRead: 0 },
+		skipped: "budget",
+	});
+
+	/** onUpdate por task: incluye el costo si el usage lo trae. */
+	const progressLine = (r: SubagentResult, total: number): string => {
+		const cost = typeof r.usage?.costUsd === "number" ? `$${r.usage.costUsd.toFixed(2)}` : "cost n/d";
+		return `subagents: ${r.id}/${total} done · exit ${r.exitCode} · ${(r.durationMs / 1000).toFixed(1)}s · ${cost} · ${r.model}`;
 	};
 
 	function killAll(): void {
@@ -254,8 +482,16 @@ export function createSubagentsRuntime(deps: RuntimeDeps = {}) {
 		}
 	}
 
-	async function runTask(task: ResolvedTask): Promise<SubagentResult> {
+	async function runTask(task: ResolvedTask, batchKey: string): Promise<SubagentResult> {
 		const startedAt = now();
+		// ID01-434 (decisión congelada): hijo CON sesión en dir descartable →
+		// usage del jsonl; stdout print-mode intacto. Se borra en finish SIEMPRE.
+		const sessionDir = path.join(sessionRoot, batchKey, task.id);
+		try {
+			mkdirSessionDir(sessionDir);
+		} catch {
+			/* si falla, el hijo puede crearlo él mismo; seguimos */
+		}
 		let stdout = "";
 		let stderr = "";
 		return new Promise<SubagentResult>((resolve) => {
@@ -276,13 +512,28 @@ export function createSubagentsRuntime(deps: RuntimeDeps = {}) {
 				const parts = [stdout];
 				if (stderr) parts.push(`[stderr]\n${stderr}`);
 				if (extraErr) parts.push(extraErr);
+				const output = trimTail(parts.filter(Boolean).join("\n"));
+				// finally (exit/timeout/kill/error): usage del jsonl o fallback chars;
+				// el dir se borra SIEMPRE, también en fallo.
+				let usage: TaskUsage;
+				try {
+					usage = readSessionUsage(sessionDir) ?? { input: 0, output: 0, cacheRead: 0, chars: output.length };
+				} catch {
+					usage = { input: 0, output: 0, cacheRead: 0, chars: output.length };
+				}
+				try {
+					rmSessionDir(sessionDir);
+				} catch {
+					/* ya borrado */
+				}
 				resolve({
 					id: task.id,
 					role: task.role,
 					model: modelKey(task.route),
 					exitCode,
 					durationMs: Math.max(0, now() - startedAt),
-					output: trimTail(parts.filter(Boolean).join("\n")),
+					output,
+					usage,
 				});
 			};
 			child = spawnFn(
@@ -295,7 +546,8 @@ export function createSubagentsRuntime(deps: RuntimeDeps = {}) {
 					"--thinking",
 					task.route.thinking,
 					"-p",
-					"--no-session",
+					"--session-dir",
+					sessionDir,
 					task.prompt,
 				],
 				{
@@ -344,6 +596,9 @@ export function createSubagentsRuntime(deps: RuntimeDeps = {}) {
 	): Promise<SubagentResult[]> {
 		const resolved = resolveTasks(tasks);
 		const myEpoch = killEpoch;
+		const batchKey = nextBatchKey();
+		const maxCostUsd = parseMaxCostUsd(baseEnv);
+		let accumulatedCost = 0; // Σ usage.costUsd de tasks YA terminados de ESTE batch
 
 		let aborted = false;
 		const onAbort = () => {
@@ -364,22 +619,25 @@ export function createSubagentsRuntime(deps: RuntimeDeps = {}) {
 				}
 				const next = queue.shift();
 				if (!next) break;
-				const r = await runTask(next.task);
+				// Presupuesto (ID01-434): se chequea ANTES de spawnear el próximo de la
+				// cola; los vivos terminan. Skip → result sintético exit 125.
+				if (maxCostUsd !== undefined && accumulatedCost >= maxCostUsd) {
+					const r = budgetSkipResult(next.task, maxCostUsd, accumulatedCost);
+					results[next.index] = r;
+					opts?.onUpdate?.({ content: [{ type: "text", text: progressLine(r, resolved.length) }] });
+					continue;
+				}
+				const r = await runTask(next.task, batchKey);
+				if (typeof r.usage?.costUsd === "number") accumulatedCost += r.usage.costUsd;
 				results[next.index] = r;
-				opts?.onUpdate?.({
-					content: [
-						{
-							type: "text",
-							text: `subagents: ${r.id}/${resolved.length} done · exit ${r.exitCode} · ${(r.durationMs / 1000).toFixed(1)}s · ${r.model}`,
-						},
-					],
-				});
+				opts?.onUpdate?.({ content: [{ type: "text", text: progressLine(r, resolved.length) }] });
 			}
 		};
 		try {
 			await Promise.all(Array.from({ length: Math.min(concurrency, resolved.length) }, worker));
 		} finally {
 			opts?.signal?.removeEventListener("abort", onAbort);
+			cleanupBatchDir(batchKey);
 		}
 		if (aborted) throw new Error("subagents: batch abortado (signal/shutdown) — hijos killed");
 		return results.map((r) => r as SubagentResult);
@@ -407,6 +665,7 @@ export function createSubagentsRuntime(deps: RuntimeDeps = {}) {
 		assertReviewerDistinct(resolved);
 		const seen = new Set<string>();
 		for (const t of resolved) {
+			assertSafeTaskId(t.id);
 			if (seen.has(t.id)) {
 				throw new Error(`subagents: id "${t.id}" repetido en el batch`);
 			}
@@ -436,6 +695,9 @@ export function createSubagentsRuntime(deps: RuntimeDeps = {}) {
 			}
 		}
 		const batch = {};
+		const batchKey = nextBatchKey();
+		const maxCostUsd = parseMaxCostUsd(baseEnv);
+		let accumulatedCost = 0; // presupuesto: Σ usage.costUsd de ESTE batch
 		for (const t of resolved) {
 			running.set(t.id, {
 				id: t.id,
@@ -465,7 +727,13 @@ export function createSubagentsRuntime(deps: RuntimeDeps = {}) {
 
 		const finishTask = (r: SubagentResult, killed: boolean): void => {
 			running.delete(r.id);
-			const state: CompletedState = killed ? "killed" : r.exitCode === 0 ? "done" : "error";
+			const state: CompletedState = killed
+				? "killed"
+				: r.skipped === "budget"
+					? "skipped"
+					: r.exitCode === 0
+						? "done"
+						: "error";
 			pushCompleted({
 				id: r.id,
 				role: r.role,
@@ -474,6 +742,8 @@ export function createSubagentsRuntime(deps: RuntimeDeps = {}) {
 				elapsed: r.durationMs,
 				exitCode: r.exitCode,
 				finishedAt: now(),
+				...(r.usage ? { usage: r.usage } : {}),
+				payg: resultPayg(r),
 			});
 			// killed = sin result real → no onComplete (deliverResult no manda nada por él)
 			if (!killed) {
@@ -510,9 +780,16 @@ export function createSubagentsRuntime(deps: RuntimeDeps = {}) {
 					});
 					continue;
 				}
+				// Presupuesto: ANTES de spawnear (nunca estuvo spawned → state
+				// "skipped"); onComplete SÍ se manda (el orquestador se entera).
+				if (maxCostUsd !== undefined && accumulatedCost >= maxCostUsd) {
+					finishTask(budgetSkipResult(task, maxCostUsd, accumulatedCost), false);
+					continue;
+				}
 				try {
 					entry.spawned = true;
-					const r = await runTask(task);
+					const r = await runTask(task, batchKey);
+					if (typeof r.usage?.costUsd === "number") accumulatedCost += r.usage.costUsd;
 					// entry.killed pudo ponerse true durante el await (killAll)
 					finishTask(r, entry.killed);
 				} catch (err) {
@@ -525,6 +802,7 @@ export function createSubagentsRuntime(deps: RuntimeDeps = {}) {
 							exitCode: -1,
 							durationMs: Math.max(0, now() - entry.startedAt),
 							output: `subagents: spawn error: ${err instanceof Error ? err.message : String(err)}`,
+							usage: { input: 0, output: 0, cacheRead: 0 },
 						},
 						entry.killed,
 					);
@@ -554,6 +832,7 @@ export function createSubagentsRuntime(deps: RuntimeDeps = {}) {
 						finishedAt: now(),
 					});
 				}
+				cleanupBatchDir(batchKey);
 			}
 		})().catch(() => {
 			// los workers ya tragan todo; esto evita unhandledRejection si algo escapa
@@ -561,11 +840,27 @@ export function createSubagentsRuntime(deps: RuntimeDeps = {}) {
 		return dispatched;
 	}
 
-	/** Snapshot sin bloquear: running + últimos completados (más reciente último). */
+	/**
+	 * Snapshot sin bloquear: running + últimos completados (más reciente último)
+	 * + totals (best-effort: el ring recorta a COMPLETED_RING_MAX=20).
+	 */
 	function status(): {
 		running: Array<{ id: string; state: "queued" | "running"; elapsed: number; role: Role; model: string }>;
 		completed: CompletedEntry[];
+		totals: { costUsd?: number; sumMs: number; payg?: boolean };
 	} {
+		let costUsd = 0;
+		let hasCost = false;
+		let sumMs = 0;
+		let payg = false;
+		for (const c of completed) {
+			sumMs += c.elapsed;
+			if (typeof c.usage?.costUsd === "number") {
+				hasCost = true;
+				costUsd += c.usage.costUsd;
+			}
+			if (c.payg) payg = true;
+		}
 		return {
 			running: [...running.values()].map((e) => ({
 				id: e.id,
@@ -575,10 +870,15 @@ export function createSubagentsRuntime(deps: RuntimeDeps = {}) {
 				model: e.model,
 			})),
 			completed: completed.slice(),
+			totals: {
+				...(hasCost ? { costUsd } : {}),
+				sumMs,
+				...(payg ? { payg: true } : {}),
+			},
 		};
 	}
 
-	return { runBatch, dispatchBackground, status, killAll };
+	return { runBatch, dispatchBackground, status, killAll, now };
 }
 
 const RoleSchema = Type.Union([
@@ -625,7 +925,8 @@ export function installSubagents(pi: ExtensionAPI, runtime = createSubagentsRunt
 			"Roles: research/grunt→qwen3.8-max low · implement→glm-5.3 medium · review→k3 high · hard→deepseek-v4-pro medium. " +
 			"background:true retorna YA con dispatched y los resultados llegan solos como mensajes subagent-result " +
 			"(consultá subagents_status). " +
-			"Usala para subtareas INDEPENDIENTES en paralelo; dependientes van secuencial. Devuelve por task: {id, role, model, exitCode, durationMs, output}.",
+			"Usala para subtareas INDEPENDIENTES en paralelo; dependientes van secuencial. " +
+			"Foreground devuelve {results:[{id, role, model, exitCode, durationMs, output, usage:{input,output,cacheRead,costUsd?}}], summary, payg}.",
 		promptSnippet: "Despachar subagentes pi paralelos por rol (research/implement/review/hard/grunt)",
 		promptGuidelines: [
 			"Usá subagents para subtareas independientes en paralelo en lugar de múltiples bash con `pi … &`; los prompts deben ser auto-contenidos y deterministas.",
@@ -657,13 +958,38 @@ export function installSubagents(pi: ExtensionAPI, runtime = createSubagentsRunt
 					signal,
 					onComplete: deliverResult,
 				});
-				const payload = { dispatched, note: "los resultados llegan como subagent-result" };
-				return { content: [{ type: "text", text: JSON.stringify(payload) }], details: { dispatched } };
+				const payg = batchPayg(params.tasks);
+				const payload = {
+					dispatched,
+					note: payg
+					? "los resultados llegan como subagent-result · incluye PAYG"
+					: "los resultados llegan como subagent-result",
+				};
+				return { content: [{ type: "text", text: JSON.stringify(payload) }], details: { dispatched, payg } };
 			}
+			const t0 = runtime.now();
 			const results = await runtime.runBatch(params.tasks, { signal, onUpdate });
+			// Envelope (SPEC-subagents-3): runBatch sigue devolviendo SubagentResult[];
+				// el wrapper arma {results, summary, payg}. costUsd solo si ALGÚN task lo trae.
+			const withCost = results.filter((r) => typeof r.usage?.costUsd === "number");
+			const costUsd =
+				withCost.length > 0 ? withCost.reduce((s, r) => s + (r.usage?.costUsd ?? 0), 0) : undefined;
+			const payg = batchPayg(params.tasks);
+			const envelope = {
+				results,
+				summary: formatBatchSummary({
+					n: results.length,
+					wallMs: runtime.now() - t0,
+					sumMs: results.reduce((s, r) => s + r.durationMs, 0),
+					costUsd,
+					payg,
+					skipped: results.filter((r) => r.skipped === "budget").length,
+				}),
+				payg,
+			};
 			return {
-				content: [{ type: "text", text: JSON.stringify(results) }],
-				details: { results },
+				content: [{ type: "text", text: JSON.stringify(envelope) }],
+				details: envelope,
 			};
 		},
 	});
@@ -671,7 +997,7 @@ export function installSubagents(pi: ExtensionAPI, runtime = createSubagentsRunt
 	pi.registerTool({
 		name: "subagents_status",
 		label: "Subagents status",
-		description: "Lista subagentes background running + últimos completados. No bloquea.",
+		description: "Lista subagentes background running + últimos completados (+totals de costo/tiempo del ring, best-effort). No bloquea.",
 		promptSnippet: "Estado de subagentes background (running + completados)",
 		parameters: Type.Object({}),
 		async execute() {
