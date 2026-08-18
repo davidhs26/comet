@@ -329,7 +329,11 @@ impl SessionsEngine {
                     // impossible for an observer to hold [new message, old status]
                     // — that gap read as unseen-with-no-live-run = a phantom
                     // "completed" flash on every remote send (2026-07-31).
-                    self.set_status(chat_id, SessionStatus::Working, false);
+                    // User prompt: restamp the task timer here, not later
+                    // at the Steered event. A parked session keeps its old
+                    // started_at; fresh_start:false would reopen that clock
+                    // (the "timer opens at 30:00 on send" bug).
+                    self.set_status(chat_id, SessionStatus::Working, true);
                     self.inner.note_message(chat_id, &request.prompt);
                     return Ok(run_id);
                 }
@@ -495,7 +499,9 @@ impl SessionsEngine {
             self.note_turn_start(chat_id, &request.cwd);
         }
         if self.is_live(chat_id, &run_id) {
-            self.set_status(chat_id, SessionStatus::Working, false);
+            // Same restamp as the routed-dispatch path: a user steer is a
+            // new task even when the child is only parked.
+            self.set_status(chat_id, SessionStatus::Working, true);
             self.inner.note_message(chat_id, prompt);
             return Ok(SteerOutcome::Accepted);
         }
@@ -776,52 +782,65 @@ impl Inner {
     }
 
     fn set_status(&self, chat_id: &str, status: SessionStatus, fresh_start: bool) {
-        let now = Utc::now();
-        let session = {
-            let mut statuses = lock(&self.statuses);
-            let entry = statuses
-                .entry(chat_id.to_string())
-                .or_insert_with(|| Session {
-                    chat_id: chat_id.to_string(),
-                    device_id: self.device_id.clone(),
-                    status,
-                    started_at: None,
-                    updated_at: now,
-                });
-            // `started_at` is the elapsed-timer base and must only ever mean
-            // "this turn". Entering Working from a settled state always
-            // restamps (a steer into a parked session is a NEW turn — reusing
-            // the old base showed the previous turn's 30min on send), and a
-            // settled session drops its base entirely so no later reader can
-            // resurrect a stale elapsed.
-            let was_active = matches!(
-                entry.status,
-                SessionStatus::Working | SessionStatus::AwaitingInput
-            );
-            entry.status = status;
-            entry.updated_at = now;
-            match status {
-                SessionStatus::Working if fresh_start || !was_active => {
-                    entry.started_at = Some(now);
-                }
-                SessionStatus::Working | SessionStatus::AwaitingInput => {}
-                SessionStatus::Idle | SessionStatus::Errored => {
-                    entry.started_at = None;
-                }
-            }
-            let session = entry.clone();
-            let mut list: Vec<Session> = statuses.values().cloned().collect();
-            list.sort_by(|a, b| a.chat_id.cmp(&b.chat_id));
-            // send_replace: keep the current value fresh even with no receivers,
-            // so late WatchSessions subscribers see the last transition.
-            self.sessions_tx.send_replace(list);
-            session
-        };
-        // Mirror the transition into the workspace doc's session-status row so
-        // remote devices' sidebars show this run (staleness-checked client-side).
+        let run_alive = lock(&self.runs).contains_key(chat_id);
+        let session = self.apply_status(chat_id, status, fresh_start, run_alive);
         if let Some(ws) = self.workspace() {
             ws.record_session(&session);
         }
+    }
+
+    /// True settle: Idle/Errored only if no run owns the chat. Holds `runs`
+    /// across the status write so a newer dispatch cannot insert between the
+    /// check and Idle (that clobber left a live child stuck-Idle).
+    fn settle_status(&self, chat_id: &str, status: SessionStatus) {
+        let session = {
+            let runs = lock(&self.runs);
+            if runs.contains_key(chat_id) {
+                return;
+            }
+            self.apply_status(chat_id, status, false, false)
+        };
+        if let Some(ws) = self.workspace() {
+            ws.record_session(&session);
+        }
+    }
+
+    fn apply_status(
+        &self,
+        chat_id: &str,
+        status: SessionStatus,
+        fresh_start: bool,
+        run_alive: bool,
+    ) -> Session {
+        let now = Utc::now();
+        let mut statuses = lock(&self.statuses);
+        let entry = statuses.entry(chat_id.to_string()).or_insert_with(|| Session {
+            chat_id: chat_id.to_string(),
+            device_id: self.device_id.clone(),
+            status,
+            started_at: None,
+            updated_at: now,
+        });
+        // `started_at` is the user-task timer base, not an internal turn.
+        // Dispatch/steer (fresh_start) restamps — never resurface a previous
+        // task's 30min on send. A PARK (run still alive) keeps it; only a
+        // true settle (no run handle) drops the base.
+        entry.status = status;
+        entry.updated_at = now;
+        match status {
+            SessionStatus::Working if fresh_start => entry.started_at = Some(now),
+            SessionStatus::Working if entry.started_at.is_none() => {
+                entry.started_at = Some(now);
+            }
+            SessionStatus::Working | SessionStatus::AwaitingInput => {}
+            SessionStatus::Idle | SessionStatus::Errored if run_alive => {}
+            SessionStatus::Idle | SessionStatus::Errored => entry.started_at = None,
+        }
+        let session = entry.clone();
+        let mut list: Vec<Session> = statuses.values().cloned().collect();
+        list.sort_by(|a, b| a.chat_id.cmp(&b.chat_id));
+        self.sessions_tx.send_replace(list);
+        session
     }
 
     /// The doc host, once wired. `None` before assembly or after retirement.
@@ -1215,7 +1234,7 @@ async fn drive_run(
                 },
             );
             inner.remove_run(&chat_id, &run_id);
-            inner.set_status(&chat_id, SessionStatus::Errored, false);
+            inner.settle_status(&chat_id, SessionStatus::Errored);
             return;
         }
     };
@@ -1660,14 +1679,17 @@ async fn drive_run(
                 self_continued_turn = true;
                 // The park cleared the fold; rotate to a fresh entry and
                 // fall through — this event is the new segment's first part.
+                // No fresh_start: this is the SAME user task continuing, so
+                // the elapsed timer must not reset on resume.
                 entry_id = new_id();
                 segment_started = now_ms();
-                inner.set_status(&chat_id, SessionStatus::Working, true);
+                inner.set_status(&chat_id, SessionStatus::Working, false);
             } else {
                 match &event {
                     AgentEvent::Steered { .. } => {
                         idle_since = None;
-                        inner.set_status(&chat_id, SessionStatus::Working, true);
+                        // User steer already restamped at send.
+                        inner.set_status(&chat_id, SessionStatus::Working, false);
                     }
                     AgentEvent::Done { .. } => {
                         idle_since = None;
@@ -1779,9 +1801,7 @@ async fn drive_run(
                     tracing::error!(chat = %chat, error = %err, "startup-crash retry dispatch failed");
                     // No run is coming: leaving the row Working would spin
                     // the session forever with nothing behind it.
-                    engine
-                        .inner
-                        .set_status(&chat, SessionStatus::Errored, false);
+                    engine.inner.settle_status(&chat, SessionStatus::Errored);
                 }
             });
             return;
@@ -1813,10 +1833,9 @@ async fn drive_run(
             dirty = false;
             entry_id = next_assistant_message_id.clone().unwrap_or_else(new_id);
             segment_started = now_ms();
-            // The elapsed timer is per user message, not per child process: a
-            // steer boundary restarts it (matches the parked-resume path and
-            // the composer's optimistic overlay, which already reads 0:00).
-            inner.set_status(&chat_id, SessionStatus::Working, true);
+            // User steer already restamped at send; do not snap 0:00 again
+            // when the Steered boundary lands a moment later.
+            inner.set_status(&chat_id, SessionStatus::Working, false);
             // The boundary confirms delivery of the oldest accepted steer —
             // retire its at-least-once ledger entry.
             if let Some(h) = lock(&inner.runs)
@@ -1984,7 +2003,7 @@ async fn drive_run(
         .map(|h| std::mem::take(&mut *lock(&h.routed_steers)).into())
         .unwrap_or_default();
     inner.remove_run(&chat_id, &run_id);
-    inner.set_status(&chat_id, final_status, false);
+    inner.settle_status(&chat_id, final_status);
     if !interrupted && !orphans.is_empty() {
         // The dying run accepted these into its mailbox but never confirmed a
         // Steered boundary (idle-reaper race, a mid-turn error discarding
@@ -2011,9 +2030,7 @@ async fn drive_run(
                     .await
                 {
                     tracing::warn!(chat = %chat, error = %err, "orphaned steer re-dispatch failed");
-                    engine
-                        .inner
-                        .set_status(&chat, SessionStatus::Errored, false);
+                    engine.inner.settle_status(&chat, SessionStatus::Errored);
                     break;
                 }
             }
