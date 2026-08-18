@@ -1,0 +1,9 @@
+{
+	"name": "comet-pi-extensions",
+	"private": true,
+	"description": "Extensiones pi versionadas + tests (tooling/pi-extensions). node_modules solo para que los tests en Node plano resuelvan 'typebox' (pi lo resuelve via jiti).",
+	"type": "module",
+	"dependencies": {
+		"typebox": "1.3.7"
+	}
+}
