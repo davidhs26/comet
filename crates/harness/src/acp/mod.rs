@@ -465,8 +465,12 @@ fn pi_spec() -> AcpAgentSpec {
                 options: Vec::new(),
             }]
         },
-        // The adapter has no `_session/steering` extension: turn boundaries.
-        steering_mode: SteeringMode::TurnBoundary,
+        // The adapter implements the `_session/steering` extension bridging to
+        // pi's native RPC `steer` (delivered before the next LLM call): steers
+        // inject mid-turn. Runtime detection stays dynamic via
+        // `initialize._meta.steering.supported`, so an unpatched adapter
+        // degrades to boundary delivery instead of breaking.
+        steering_mode: SteeringMode::StepBoundary,
         // pi's thinking ladder (minimal→max; its extra "off" tier has no zeron
         // equivalent and is left to the agent default).
         reasoning_levels: &[
