@@ -19,7 +19,7 @@ process.env.PI_SUBAGENTS_TRANSCRIPT_ROOT = path.join(os.tmpdir(), "pi-subagents-
 
 const here = import.meta.dirname;
 const mod = await import(url.pathToFileURL(path.join(here, "subagents.ts")).href);
-const { resolveRoute, canSpawn, assertReviewerDistinct, trimTail, createSubagentsRuntime, ROUTES, modelKey, chooseDeliverOpts, UTILITY_PROMPT_PREFIX, formatSubagentResult, installSubagents, sumUsage, usageFromSessionJsonl, parseMaxCostUsd, formatBatchSummary, effectiveTimeoutMs, ROLE_TIMEOUT_FLOOR_MS, resolveChildMode, resolveTranscriptRoot, DEFAULT_TRANSCRIPT_ROOT, SESSION_DIR_RM_DELAY_MS, childSessionIdFor, formatSpawnedLine, formatFinishedLine, finishStatusFor, resolveInactivityMs, INACTIVITY_TIMEOUT_MS, wrapTaskPrompt, REVIEW_JURISDICTION_RULE, REVIEW_PREEXISTING_SECTION } = mod;
+const { resolveRoute, canSpawn, assertReviewerDistinct, trimTail, createSubagentsRuntime, ROUTES, modelKey, chooseDeliverOpts, UTILITY_PROMPT_PREFIX, formatSubagentResult, installSubagents, sumUsage, usageFromSessionJsonl, parseMaxCostUsd, formatBatchSummary, effectiveTimeoutMs, ROLE_TIMEOUT_FLOOR_MS, resolveChildMode, resolveTranscriptRoot, DEFAULT_TRANSCRIPT_ROOT, SESSION_DIR_RM_DELAY_MS, childSessionIdFor, formatSpawnedLine, formatFinishedLine, finishStatusFor, resolveInactivityMs, INACTIVITY_TIMEOUT_MS, wrapTaskPrompt, REVIEW_JURISDICTION_RULE, REVIEW_PREEXISTING_SECTION, SPECIFY_ROLE_PROMPT, SPECIFY_ROLE_MARKER } = mod;
 
 let passed = 0;
 const failures = [];
@@ -117,6 +117,7 @@ await test("routing role→modelo (tabla del spec)", () => {
 	assert.deepEqual([modelKey(ROUTES.grunt), ROUTES.grunt.thinking], ["alibaba/qwen3.8-max", "low"]);
 	assert.deepEqual([modelKey(ROUTES.implement), ROUTES.implement.thinking], ["zai/glm-5.3", "medium"]);
 	assert.deepEqual([modelKey(ROUTES.review), ROUTES.review.thinking], ["kimi-coding/k3", "high"]);
+	assert.deepEqual([modelKey(ROUTES.specify), ROUTES.specify.thinking], ["zai/glm-5.3", "medium"]);
 	assert.deepEqual(
 		[modelKey(ROUTES.hard), ROUTES.hard.thinking],
 		["deepseek-payg/deepseek/deepseek-v4-pro", "medium"],
@@ -162,6 +163,23 @@ await test("wrapTaskPrompt: review antepone la regla exacta; otros roles no toca
 	assert.equal((topped.match(new RegExp(REVIEW_JURISDICTION_RULE.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g")) || []).length, 1, "no duplica la regla");
 });
 
+await test("wrapTaskPrompt: specify inyecta las 6 secciones y no toca otros roles (ID01-488)", () => {
+	assert.equal(wrapTaskPrompt("grunt", "hola"), "hola");
+	assert.equal(wrapTaskPrompt("implement", "hola"), "hola");
+	assert.ok(typeof SPECIFY_ROLE_PROMPT === "string" && SPECIFY_ROLE_PROMPT.length > 0);
+	const wrapped = wrapTaskPrompt("specify", "acá va la evidencia");
+	assert.ok(wrapped.startsWith(SPECIFY_ROLE_PROMPT), "prompt del specifier al inicio");
+	assert.ok(wrapped.includes("NO escribís código"), "no escribe código");
+	for (const bit of ["Objetivo", "Contexto y archivos involucrados", "Constraints y convenciones", "OUT-OF-SCOPE", "Criterios de aceptación", "Tareas ordenadas"]) {
+		assert.ok(wrapped.includes(bit), `falta sección ${bit}`);
+	}
+	assert.ok(wrapped.endsWith("acá va la evidencia"), "prompt original al final");
+	assert.equal(wrapTaskPrompt("specify", wrapped), wrapped, "idempotente vía prompt completo");
+	const cited = `nota: ${SPECIFY_ROLE_MARKER} ya está en la evidencia\n\ndatos`;
+	assert.equal(wrapTaskPrompt("specify", cited), cited, "idempotente vía marcador corto");
+	assert.ok(SPECIFY_ROLE_PROMPT.startsWith(SPECIFY_ROLE_MARKER), "el prompt arranca con el marcador");
+});
+
 // ---------- canSpawn ----------
 await test("canSpawn: depth <1 ok, >=1 rechaza, basura tolerada", () => {
 	assert.equal(canSpawn({}), true);
@@ -204,6 +222,29 @@ await test("batch sin mezcla review+implement no valida cruce", () => {
 		{ role: "research", route: resolveRoute("research") },
 	];
 	assert.doesNotThrow(() => assertReviewerDistinct(items));
+});
+
+await test("specify no cuenta como implementador (mismo modelo que review no traba) (ID01-488)", () => {
+	assert.doesNotThrow(() =>
+		assertReviewerDistinct([
+			{ role: "specify", route: resolveRoute("specify") },
+			{ role: "review", route: resolveRoute("review", "zai/glm-5.3") },
+		]),
+	);
+	assert.doesNotThrow(() =>
+		assertReviewerDistinct([
+			{ role: "specify", route: resolveRoute("specify") },
+			{ role: "implement", route: resolveRoute("implement") },
+		]),
+	);
+	assert.throws(
+		() =>
+			assertReviewerDistinct([
+				{ role: "implement", route: resolveRoute("implement") },
+				{ role: "review", route: resolveRoute("review", "zai/glm-5.3") },
+			]),
+		/mismo modelo/,
+	);
 });
 
 // ---------- trimTail ----------

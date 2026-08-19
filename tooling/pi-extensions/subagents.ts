@@ -34,6 +34,10 @@
  * override PI_SUBAGENTS_TRANSCRIPT_ROOT / deps.sessionRoot) y rm del sessionDir
  * diferido ≥2.5s post-finish para que el engine tailee el JSONL (drain).
  *
+ * v6 (ID01-488): rol `specify` (zai/glm-5.3 @ medium) — spec-writing barato.
+ * wrapTaskPrompt inyecta SPECIFY_ROLE_PROMPT; assertReviewerDistinct NO lo
+ * trata como implementador (no escribe código).
+ *
  * No toca el engine.
  */
 import { spawn, type ChildProcess } from "node:child_process";
@@ -52,7 +56,7 @@ export const TIMEOUT_EXIT_CODE = 124;
 /** Convención "no corrido": task NO despachado por presupuesto (ID01-434). */
 export const BUDGET_SKIP_EXIT_CODE = 125;
 
-export type Role = "research" | "implement" | "review" | "hard" | "grunt";
+export type Role = "research" | "implement" | "review" | "hard" | "grunt" | "specify";
 export type ThinkingLevel = "minimal" | "low" | "medium" | "high" | "xhigh";
 
 export interface Route {
@@ -67,6 +71,7 @@ export const ROUTES: Record<Role, Route> = {
 	grunt: { provider: "alibaba", model: "qwen3.8-max", thinking: "low" },
 	implement: { provider: "zai", model: "glm-5.3", thinking: "medium" },
 	review: { provider: "kimi-coding", model: "k3", thinking: "high" },
+	specify: { provider: "zai", model: "glm-5.3", thinking: "medium" },
 	hard: {
 		provider: "deepseek-payg",
 		model: "deepseek/deepseek-v4-pro",
@@ -93,6 +98,7 @@ export const ROLE_TIMEOUT_FLOOR_MS: Record<Role, number> = {
 	review: 1_800_000,
 	research: 900_000,
 	grunt: 900_000,
+	specify: 900_000,
 };
 
 /**
@@ -249,10 +255,26 @@ export const REVIEW_JURISDICTION_RULE =
 export const REVIEW_PREEXISTING_SECTION = "deuda preexistente detectada";
 
 /**
- * Prefijo inyectado al prompt del hijo review (print argv + rpc stdin).
- * promptGuidelines de la tool solo lo ve el padre; el reviewer hijo no.
+ * Prompt inyectado al hijo specify (print argv + rpc stdin). Semilla adaptada
+ * del `specifier` de opencode-agent-orchestration-kit (Apache 2.0; harvest
+ * ID01-397 / ID01-488). Atribución acá, no en el prompt del hijo.
+ */
+/** Marcador corto de idempotencia (mismo criterio que REVIEW_JURISDICTION_RULE). */
+export const SPECIFY_ROLE_MARKER = "Sos un specifier:";
+
+export const SPECIFY_ROLE_PROMPT =
+	"Sos un specifier: convertís investigación cruda en un spec de implementación auto-contenido. NO escribís código. Tu output tiene EXACTAMENTE estas secciones: 1) Objetivo (una frase); 2) Contexto y archivos involucrados (paths reales verificados); 3) Constraints y convenciones del repo; 4) OUT-OF-SCOPE explícito (qué NO se hace — sé agresivo acá); 5) Criterios de aceptación verificables (comandos/tests concretos); 6) Tareas ordenadas. Si te falta información para una sección, decílo explícitamente en vez de inventar.";
+
+/**
+ * Prefijo inyectado al prompt del hijo (print argv + rpc stdin).
+ * promptGuidelines de la tool solo lo ve el padre; el hijo no.
+ * review → jurisdicción; specify → plantilla de spec (ID01-488).
  */
 export function wrapTaskPrompt(role: Role, prompt: string): string {
+	if (role === "specify") {
+		if (prompt.includes(SPECIFY_ROLE_MARKER)) return prompt;
+		return `${SPECIFY_ROLE_PROMPT}\n\n${prompt}`;
+	}
 	if (role !== "review") return prompt;
 	const prefix: string[] = [];
 	if (!prompt.includes(REVIEW_JURISDICTION_RULE)) prefix.push(REVIEW_JURISDICTION_RULE);
@@ -265,6 +287,7 @@ export function wrapTaskPrompt(role: Role, prompt: string): string {
 /**
  * Regla dura §7: si el batch mezcla review + implement, los MODELOS RESUELTOS
  * de revisor e implementador deben diferir (revisor ≠ implementador).
+ * `specify` NO es implementador (no escribe código) — ID01-488.
  */
 export function assertReviewerDistinct(items: Array<{ role: Role; route: Route }>): void {
 	const reviewers = items.filter((t) => t.role === "review");
@@ -1581,6 +1604,7 @@ const RoleSchema = Type.Union([
 	Type.Literal("review"),
 	Type.Literal("hard"),
 	Type.Literal("grunt"),
+	Type.Literal("specify"),
 ]);
 const ThinkingSchema = Type.Union([
 	Type.Literal("minimal"),
@@ -1637,17 +1661,18 @@ export function installSubagents(pi: ExtensionAPI, runtime = createSubagentsRunt
 		label: "Subagents",
 		description:
 			"Despacha N subagentes pi en paralelo (foreground: espera a todos y devuelve resultados). " +
-			"Roles: research/grunt→qwen3.8-max low · implement→glm-5.3 medium · review→k3 high · hard→deepseek-v4-pro medium. " +
+			"Roles: research/grunt→qwen3.8-max low · specify→glm-5.3 medium (spec-writing, no código) · implement→glm-5.3 medium · review→k3 high · hard→deepseek-v4-pro medium. " +
 			"background:true retorna YA con dispatched y los resultados llegan solos como mensajes subagent-result " +
 			"(consultá subagents_status). " +
 			"Usala para subtareas INDEPENDIENTES en paralelo; dependientes van secuencial. " +
 			"Foreground devuelve {results:[{id, role, model, exitCode, durationMs, output, usage:{input,output,cacheRead,costUsd?}}], summary, payg}.",
-		promptSnippet: "Despachar subagentes pi paralelos por rol (research/implement/review/hard/grunt)",
+		promptSnippet: "Despachar subagentes pi paralelos por rol (research/implement/review/hard/grunt/specify)",
 		promptGuidelines: [
 			"Usá subagents para subtareas independientes en paralelo en lugar de múltiples bash con `pi … &`; los prompts deben ser auto-contenidos y deterministas.",
 			"DEFAULT foreground: bloquea, streamea el progreso al usuario y devuelve los resultados en el mismo turno. Si el usuario pide 'lanzá X y reportame', eso es foreground.",
 			"background:true SOLO si vas a seguir trabajando en OTRA cosa mientras corren (los resultados llegan como subagent-result y despiertan el turno). No esperes con sleeps; subagents_status da el estado.",
 			"Rol review: Solo pueden bloquear los problemas que la tarea actual introdujo o empeoró. La deuda preexistente se reporta en sección aparte, no-bloqueante, como candidata a issues. La extensión inyecta esta regla en el prompt del hijo review (wrapTaskPrompt).",
+			"Rol specify: destilá evidencia cruda en un spec auto-contenido (NO código). Patrón: research (qwen) junta evidencia → specify (glm) escribe el spec → implement ejecuta. Specify no cuenta como implementador para revisor≠implementador.",
 		],
 		parameters: Type.Object({
 			tasks: Type.Array(
@@ -1658,7 +1683,7 @@ export function installSubagents(pi: ExtensionAPI, runtime = createSubagentsRunt
 					cwd: Type.Optional(Type.String({ description: "directorio de trabajo; default cwd actual" })),
 					model: Type.Optional(Type.String({ description: 'override "provider/model", split en el primer "/"' })),
 					thinking: Type.Optional(ThinkingSchema),
-					timeoutMs: Type.Optional(Type.Number({ description: "CAP duro por task (no timeout de ejecución): un hijo colgado cae antes por inactividad (600s sin eventos). Clampeado al piso del rol (implement/hard 60min, review 30min, research/grunt 15min). Default: el piso del rol." })),
+					timeoutMs: Type.Optional(Type.Number({ description: "CAP duro por task (no timeout de ejecución): un hijo colgado cae antes por inactividad (600s sin eventos). Clampeado al piso del rol (implement/hard 60min, review 30min, research/grunt/specify 15min). Default: el piso del rol." })),
 				}),
 				{ minItems: 1 },
 			),
