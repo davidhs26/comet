@@ -134,6 +134,7 @@
 			);
 			name = ZeronTests;
 			packageProductDependencies = (
+				A2000000000000000000P002 /* Loro */,
 			);
 			productName = ZeronTests;
 			productReference = A2000000000000000000PR01 /* ZeronTests.xctest */;
@@ -395,6 +396,11 @@
 
 /* Begin XCSwiftPackageProductDependency section */
 		A1000000000000000000P002 /* Loro */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = A1000000000000000000P001 /* XCRemoteSwiftPackageReference "loro-swift" */;
+			productName = Loro;
+		};
+		A2000000000000000000P002 /* Loro */ = {
 			isa = XCSwiftPackageProductDependency;
 			package = A1000000000000000000P001 /* XCRemoteSwiftPackageReference "loro-swift" */;
 			productName = Loro;

@@ -177,15 +177,45 @@ struct RenderToolCall: Hashable {
     var string: (String) -> String? { { key in self.fields[key] as? String } }
 }
 
+/// Subagent spawn stamping (crates/doc/src/schema.rs:558-564): the engine
+/// writes these keys on the PARENT's tool part — the child's events never
+/// reach the parent transcript, they route to the child's own doc
+/// (crates/engine/src/sessions.rs:1483).
+struct SubagentInfo: Hashable {
+    /// Doc id of the child transcript: `{chatId}--sub--{toolUseId}`.
+    var docId: String
+    var status: SubagentStatus
+    /// One-line tail of the child's latest output.
+    var tail: String?
+}
+
+enum SubagentStatus: String, Hashable {
+    case running, done, failed
+}
+
+/// Desktop `view.rs` strip: Unknown named `Agent: {id} ({role})` shows
+/// as label "Agent" + the suffix as detail. Without the strip the chip
+/// reads "Agent  Agent: t1 (research)" — two labels fighting (ID01-485).
+func agentChipDetail(name: String?, fallback: String) -> String {
+    let raw = name ?? ""
+    if raw.hasPrefix("Agent: ") {
+        let suffix = String(raw.dropFirst("Agent: ".count))
+        return suffix.isEmpty ? fallback : suffix
+    }
+    if raw == "Agent" || raw.isEmpty { return fallback }
+    return raw
+}
+
 enum MessagePart: Hashable, Identifiable {
     case text(id: String, text: String)
-    case tool(id: String, call: RenderToolCall, isError: Bool, resolved: Bool)
+    case tool(id: String, call: RenderToolCall, isError: Bool, resolved: Bool,
+              subagent: SubagentInfo? = nil)
     case input(id: String, requestId: String, questions: [UserInputQuestion], resolved: Bool)
     case error(id: String, message: String)
 
     var id: String {
         switch self {
-        case .text(let id, _), .tool(let id, _, _, _), .input(let id, _, _, _), .error(let id, _):
+        case .text(let id, _), .tool(let id, _, _, _, _), .input(let id, _, _, _), .error(let id, _):
             return id
         }
     }

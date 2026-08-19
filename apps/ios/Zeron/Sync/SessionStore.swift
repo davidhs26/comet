@@ -422,8 +422,20 @@ final class SessionStore {
             }
             // isError presence IS the resolution marker (schema.rs:96).
             let isError = m["isError"]?.boolValue
+            // Subagent stamping (schema.rs:558-564): ref/status/tail ride the
+            // parent's tool part; parts predating the keys decode with nil.
+            // An unknown/absent status is "still in flight" — the decode must
+            // never invent `failed` from silence.
+            var subagent: SubagentInfo?
+            if let ref = m["subagentRef"]?.stringValue {
+                let status = m["subagentStatus"]?.stringValue
+                    .flatMap(SubagentStatus.init(rawValue:)) ?? .running
+                subagent = SubagentInfo(docId: ref, status: status,
+                                        tail: m["subagentTail"]?.stringValue)
+            }
             return .tool(id: id, call: RenderToolCall(tag: tag, fields: fields),
-                         isError: isError ?? false, resolved: isError != nil)
+                         isError: isError ?? false, resolved: isError != nil,
+                         subagent: subagent)
         case "input":
             var questions: [UserInputQuestion] = []
             if let list = m["questions"]?.listValue,

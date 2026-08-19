@@ -607,6 +607,25 @@ final class AppModel {
         // Preloaded stores stay warm — nothing to evict on navigation.
     }
 
+    /// Subagent transcript store (ID01-485). The subdoc is NOT a registry
+    /// chat — there is no Chat row for `{chatId}--sub--{toolUseId}`, so
+    /// sessionStore(for:) can't apply (it needs deviceId/roomGen off the
+    /// row). Mint the store directly and assert roomGen 2: the subdoc is
+    /// born in the chat2 era by construction (the engine routes its events
+    /// to chat2/{subDocId}/ws from the first one), so there is no legacy s2
+    /// lineage for the M2 gate to hold back. Same warm dict as chat stores —
+    /// logout cleanup, background flush and network kicks apply unchanged.
+    func subagentStore(docId: String) -> SessionStore? {
+        if let demo { return demo.sessionStore(for: docId) }
+        guard let config else { return nil }
+        if let existing = sessionStores[docId] { return existing }
+        let store = SessionStore(chatId: docId, config: config)
+        sessionStores[docId] = store
+        store.updateRoomGen(2)
+        store.start()
+        return store
+    }
+
     /// Warm every non-archived session: stores hydrate from disk instantly
     /// so opening a session never shows a loading state. The room DIALS are
     /// held and released one per 300ms in attention order — N simultaneous
