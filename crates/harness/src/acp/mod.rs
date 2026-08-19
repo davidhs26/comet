@@ -1798,6 +1798,25 @@ fn steering_call_future(
     prompt_like_request(client.clone(), "_session/steering", params)
 }
 
+/// ID01-475 (2026-08-19): default OFF. The blanket quiet settle is
+/// superseded: turn end is deterministic via `_x.ai/session/prompt_complete`
+/// (grok) and via the `session/prompt` response itself (every agent);
+/// total initial silence is covered by grok's `prompt_stall` (other ACP
+/// agents have none); a genuinely quiet
+/// live turn is parked — recoverably — by the engine's quiesce watchdog
+/// instead of being falsely settled. On thinking-heavy agents the blanket
+/// killed live turns after 30s of stream silence (session
+/// `20-39-01-735Z`: gaps of 35-78s while grok-4.6 reasoned; 20 real edits,
+/// 0 errors, orphaned WIP). Re-habilitable with `ZERON_ACP_QUIET_SETTLE=1`.
+/// Read ONCE per process (OnceLock) — flipping it requires a restart.
+fn quiet_settle_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("ZERON_ACP_QUIET_SETTLE")
+            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    })
+}
+
 /// The per-run event loop: one task multiplexing agent messages, the pending
 /// turn, the steering mailbox, the interrupt token, and consumer liveness.
 async fn run_session(session: Session) {
@@ -2110,14 +2129,22 @@ async fn run_session(session: Session) {
     // Done ever comes, and the session strands Working until the engine's
     // quiesce watchdog parks it.
     //
-    // `ZERON_ACP_QUIET_SETTLE_MS` overrides; 0 disables.
-    let quiet_settle: Option<Duration> = match std::env::var("ZERON_ACP_QUIET_SETTLE_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-    {
-        Some(0) => None,
-        Some(ms) => Some(Duration::from_millis(ms)),
-        None => Some(Duration::from_secs(30)),
+    // `ZERON_ACP_QUIET_SETTLE_MS` overrides; 0 disables. ID01-475: the
+    // whole watchdog is gated by `ZERON_ACP_QUIET_SETTLE` (default OFF,
+    // read once per process) — the MS knob only applies with the gate ON,
+    // so a stale `ZERON_ACP_QUIET_SETTLE_MS` in the environment does not
+    // re-arm it.
+    let quiet_settle: Option<Duration> = if !quiet_settle_enabled() {
+        None
+    } else {
+        match std::env::var("ZERON_ACP_QUIET_SETTLE_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            Some(0) => None,
+            Some(ms) => Some(Duration::from_millis(ms)),
+            None => Some(Duration::from_secs(30)),
+        }
     };
     let mut last_update_at = tokio::time::Instant::now();
     let mut turn_content_seen = false;

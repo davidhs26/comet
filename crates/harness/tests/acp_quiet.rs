@@ -1,8 +1,9 @@
-//! Blanket dropped-reply settle (`ZERON_ACP_QUIET_SETTLE_MS`), tested with
-//! the GROK spec so no adapter-specific evidence (Claude's cost frame,
-//! `noRunningTurn` steering reasons) is in play — this is the path every ACP
-//! agent gets. Own test binary: the env knob is process-global, and every
-//! test here shares the one value.
+//! Blanket dropped-reply settle (`ZERON_ACP_QUIET_SETTLE` gate ON via
+//! `ZERON_ACP_QUIET_SETTLE_MS`), tested with the GROK spec so no
+//! adapter-specific evidence (Claude's cost frame, `noRunningTurn` steering
+//! reasons) is in play — this is the path every ACP agent gets. Own test
+//! binary: the env knobs are process-global, and every test here shares
+//! the one value.
 
 use std::path::PathBuf;
 use std::sync::Once;
@@ -22,8 +23,11 @@ fn init_env() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
         // SAFETY: set before any harness runs in this test process; all
-        // tests in this binary share the one value.
+        // tests in this binary share the one value. ID01-475: the watchdog
+        // is gated OFF by default — this binary opts IN to keep covering
+        // the ON path.
         unsafe { std::env::set_var("ZERON_ACP_QUIET_SETTLE_MS", QUIET_MS.to_string()) };
+        unsafe { std::env::set_var("ZERON_ACP_QUIET_SETTLE", "1") };
     });
 }
 
