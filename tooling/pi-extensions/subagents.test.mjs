@@ -19,7 +19,7 @@ process.env.PI_SUBAGENTS_TRANSCRIPT_ROOT = path.join(os.tmpdir(), "pi-subagents-
 
 const here = import.meta.dirname;
 const mod = await import(url.pathToFileURL(path.join(here, "subagents.ts")).href);
-const { resolveRoute, canSpawn, assertReviewerDistinct, trimTail, createSubagentsRuntime, ROUTES, modelKey, chooseDeliverAs, formatSubagentResult, installSubagents, sumUsage, usageFromSessionJsonl, parseMaxCostUsd, formatBatchSummary, effectiveTimeoutMs, ROLE_TIMEOUT_FLOOR_MS, resolveChildMode, resolveTranscriptRoot, DEFAULT_TRANSCRIPT_ROOT, SESSION_DIR_RM_DELAY_MS, childSessionIdFor, formatSpawnedLine, formatFinishedLine, finishStatusFor, resolveInactivityMs, INACTIVITY_TIMEOUT_MS } = mod;
+const { resolveRoute, canSpawn, assertReviewerDistinct, trimTail, createSubagentsRuntime, ROUTES, modelKey, chooseDeliverOpts, UTILITY_PROMPT_PREFIX, formatSubagentResult, installSubagents, sumUsage, usageFromSessionJsonl, parseMaxCostUsd, formatBatchSummary, effectiveTimeoutMs, ROLE_TIMEOUT_FLOOR_MS, resolveChildMode, resolveTranscriptRoot, DEFAULT_TRANSCRIPT_ROOT, SESSION_DIR_RM_DELAY_MS, childSessionIdFor, formatSpawnedLine, formatFinishedLine, finishStatusFor, resolveInactivityMs, INACTIVITY_TIMEOUT_MS } = mod;
 
 let passed = 0;
 const failures = [];
@@ -394,9 +394,9 @@ await test("onComplete: 1 call por task, en orden de completado (t2 antes que t1
 	assert.deepEqual(calls, ["t2", "t1"], "orden de completado, no de dispatch");
 });
 
-await test("chooseDeliverAs: agente vivo → steer, idle → nextTurn", () => {
-	assert.equal(chooseDeliverAs(true), "steer");
-	assert.equal(chooseDeliverAs(false), "nextTurn");
+await test("chooseDeliverOpts: agente vivo → steer, idle → triggerTurn (revisión 2026-08-19: nextTurn era agujero negro)", () => {
+	assert.deepEqual(chooseDeliverOpts(true), { deliverAs: "steer" });
+	assert.deepEqual(chooseDeliverOpts(false), { triggerTurn: true });
 });
 
 await test("formatSubagentResult: formato congelado del spec (434: costBit)", () => {
@@ -660,7 +660,7 @@ function makeFakePi() {
 	return { pi, tools, handlers, sent };
 }
 
-await test("installSubagents: steer si live, nextTurn si idle, nada post-shutdown", async () => {
+await test("installSubagents: steer si live, triggerTurn si idle, nada post-shutdown", async () => {
 	const fake = makeFakeSpawn();
 	const rt = createSubagentsRuntime({ spawnFn: fake.spawnFn });
 	const { pi, tools, handlers, sent } = makeFakePi();
@@ -698,7 +698,8 @@ await test("installSubagents: steer si live, nextTurn si idle, nada post-shutdow
 	await tick();
 	await idle;
 	assert.equal(sent.length, 2);
-	assert.equal(sent[1].opts.deliverAs, "nextTurn");
+	assert.equal(sent[1].opts.triggerTurn, true, "idle → despierta el turno para reportar");
+	assert.equal(sent[1].opts.deliverAs, undefined);
 
 	handlers.session_shutdown();
 	const after = tools.subagents.execute(
@@ -713,6 +714,46 @@ await test("installSubagents: steer si live, nextTurn si idle, nada post-shutdow
 	await tick();
 	await after.catch(() => {});
 	assert.equal(sent.length, 2, "post-shutdown no manda sendMessage");
+});
+
+await test("gate de utilería: sesión de titulado NO spawnea subagentes (incidente 2026-08-19)", async () => {
+	const fake = makeFakeSpawn();
+	const rt = createSubagentsRuntime({ spawnFn: fake.spawnFn });
+	const { pi, tools, handlers } = makeFakePi();
+	installSubagents(pi, rt);
+	// El engine manda el prompt de titulado con la tarea del usuario embebida.
+	handlers.input({
+		text: `${UTILITY_PROMPT_PREFIX} in Title Case (no quotes, no punctuation) for a coding session that begins with this request:\n\nLanzá DOS subagentes en paralelo...`,
+		source: "rpc",
+	});
+	const r = await tools.subagents.execute("tc-util", { tasks: [{ id: "t1", prompt: "x" }] }, undefined, undefined);
+	assert.match(r.content[0].text, /utilería/, "rechaza con explicación");
+	assert.equal(fake.procs.length, 0, "cero spawns en sesión de utilería");
+	// Un input normal NO activa el gate (sesión nueva).
+	const fake2 = makeFakeSpawn();
+	const rt2 = createSubagentsRuntime({ spawnFn: fake2.spawnFn });
+	const { pi: pi2, tools: tools2, handlers: handlers2 } = makeFakePi();
+	installSubagents(pi2, rt2);
+	handlers2.input({ text: "Lanzá dos subagentes de verdad", source: "rpc" });
+	const p = tools2.subagents.execute("tc-real", { tasks: [{ id: "t1", prompt: "x" }] }, undefined, undefined);
+	await tick();
+	assert.equal(fake2.procs.length, 1, "sesión real sí spawnea");
+	fake2.finishProc(fake2.procs[0], 0, null, "ok");
+	await p;
+});
+
+await test("gate de utilería SOLO evalúa el primer input: un mensaje posterior con el prefijo no envenena la sesión (hallazgo k3)", async () => {
+	const fake = makeFakeSpawn();
+	const rt = createSubagentsRuntime({ spawnFn: fake.spawnFn });
+	const { pi, tools, handlers } = makeFakePi();
+	installSubagents(pi, rt);
+	handlers.input({ text: "Implementá el issue 490 como hablamos", source: "rpc" });
+	handlers.input({ text: `${UTILITY_PROMPT_PREFIX} for this PR`, source: "rpc" }); // usuario legítimo, mensaje 2
+	const p = tools.subagents.execute("tc-post", { tasks: [{ id: "t1", prompt: "x" }] }, undefined, undefined);
+	await tick();
+	assert.equal(fake.procs.length, 1, "el gate no se activó: spawnea normal");
+	fake.finishProc(fake.procs[0], 0, null, "ok");
+	await p;
 });
 
 // ---------- ID01-434: usage/costo + presupuesto + envelope ----------

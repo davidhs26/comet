@@ -7,8 +7,9 @@
  *
  * v2 (ID01-433): `background:true` despacha y retorna YA con {dispatched, note};
  * los resultados llegan solos como mensajes `subagent-result` vía pi.sendMessage
- * (chooseDeliverAs: steer si el agente está vivo, nextTurn si idle — jamás
- * triggerTurn). Tool nueva `subagents_status` (running + ring de 20 completados).
+ * (chooseDeliverOpts: steer si el agente está vivo, triggerTurn:true si idle —
+ * revisado 2026-08-19: nextTurn dejaba los resultados en un agujero negro).
+ * Tool nueva `subagents_status` (running + ring de 20 completados).
  * Background NO es durable: el store vive en el proceso pi, no sobrevive restart.
  *
  * - Copia versionada: /home/david/comet/tooling/pi-extensions/subagents.ts
@@ -269,13 +270,24 @@ export function trimTail(text: string, capBytes: number = OUTPUT_CAP_BYTES): str
 }
 
 /**
- * Entrega de subagent-result (ID01-433, decisión congelada):
+ * Entrega de subagent-result (ID01-433, REVISADA 2026-08-19 tras incidente):
  * agente vivo → "steer" (entra antes de la próxima llamada al LLM);
- * idle → "nextTurn" (encolado al próximo prompt; NO dispara turno).
- * `triggerTurn` está PROHIBIDO en v1 (turno SELF-CONTINUED en Zeron idle).
+ * idle → { triggerTurn: true }: el resultado despierta el turno y el
+ * orquestador lo reporta al usuario.
+ *
+ * La política v1 ("jamás triggerTurn"; idle → nextTurn) creó un agujero
+ * negro: nextTurn queda encolado hasta el PRÓXIMO prompt del usuario — que
+ * puede no llegar nunca — y el reaper de sesiones idle del engine mata pi
+ * (~30 min) con el store background en memoria. Resultado real: batch
+ * completado, cero evidencia en el chat (smoke test 2026-08-19). Un turno
+ * disparado por completions es exactamente lo que la doctrina de reportes
+ * ≤25s espera. Sin loop de mecanismo: pi flipea isStreaming SINCRÓNICO al
+ * arrancar el turno, así que N completions idle coalescen en 1 turno +
+ * N-1 steers (verificado contra agent-session.js por el review k3), y la
+ * entrega no emite `input` ni re-lanza nada por sí misma.
  */
-export function chooseDeliverAs(agentLive: boolean): "steer" | "nextTurn" {
-	return agentLive ? "steer" : "nextTurn";
+export function chooseDeliverOpts(agentLive: boolean): { deliverAs?: "steer"; triggerTurn?: boolean } {
+	return agentLive ? { deliverAs: "steer" } : { triggerTurn: true };
 }
 
 // ---------- ID01-434: usage/costo + presupuesto ----------
@@ -1557,10 +1569,26 @@ const ThinkingSchema = Type.Union([
 	Type.Literal("xhigh"),
 ]);
 
+/**
+ * Apertura canónica de los prompts de utilería del engine (titulado de
+ * chats). Cubre las dos variantes de crates/engine (titles.rs arma
+ * "{TITLE_PROMPT_PREFIX} 3-5 word title in Title Case…"; pi_adopt.rs usa la
+ * frase equivalente) — si cambian allá, cambia acá. Solo el PRIMER input de
+ * la sesión puede activar el gate (las corridas de utilería son de un solo
+ * prompt): un usuario legítimo que empiece un mensaje posterior igual no
+ * envenena nada (hallazgo bloqueante del review k3). Incidente 2026-08-19:
+ * las sesiones de titulado ejecutaron la tarea embebida y lanzaron sus
+ * propios batches (2 veces). Follow-up estructural: marcador explícito del
+ * engine en vez de sniffing de texto.
+ */
+export const UTILITY_PROMPT_PREFIX = "Reply with ONLY a concise 3-5 word title";
+
 /** Wiring testeable: inyectá runtime (spawn/now) y un `pi` mock. */
 export function installSubagents(pi: ExtensionAPI, runtime = createSubagentsRuntime()): void {
 	let agentLive = false; // agent_start → true, agent_settled → false (no agent_end: hay retries/compaction)
 	let shutdown = false;
+	let utilityRun = false; // sesión de utilería del engine (titulado): tools deshabilitadas
+	let firstInputSeen = false; // el gate solo evalúa el PRIMER input (utilería = un prompt)
 
 	pi.on("agent_start", () => {
 		agentLive = true;
@@ -1568,13 +1596,18 @@ export function installSubagents(pi: ExtensionAPI, runtime = createSubagentsRunt
 	pi.on("agent_settled", () => {
 		agentLive = false;
 	});
+	pi.on("input", (ev: { text?: string }) => {
+		if (firstInputSeen) return;
+		firstInputSeen = true;
+		if (typeof ev?.text === "string" && ev.text.startsWith(UTILITY_PROMPT_PREFIX)) utilityRun = true;
+	});
 
 	/** Entrega un resultado como subagent-result (1 sendMessage por task, sin concatenar). */
 	const deliverResult = (result: SubagentResult): void => {
 		if (shutdown) return; // tras session_shutdown no mandamos sendMessage
 		pi.sendMessage(
 			{ customType: "subagent-result", content: formatSubagentResult(result), display: true, details: result },
-			{ deliverAs: chooseDeliverAs(agentLive) }, // jamás triggerTurn
+			chooseDeliverOpts(agentLive),
 		);
 	};
 
@@ -1591,7 +1624,8 @@ export function installSubagents(pi: ExtensionAPI, runtime = createSubagentsRunt
 		promptSnippet: "Despachar subagentes pi paralelos por rol (research/implement/review/hard/grunt)",
 		promptGuidelines: [
 			"Usá subagents para subtareas independientes en paralelo en lugar de múltiples bash con `pi … &`; los prompts deben ser auto-contenidos y deterministas.",
-			"Con background:true no esperes con sleeps: los resultados llegan como subagent-result; chequeá subagents_status si necesitás el estado.",
+			"DEFAULT foreground: bloquea, streamea el progreso al usuario y devuelve los resultados en el mismo turno. Si el usuario pide 'lanzá X y reportame', eso es foreground.",
+			"background:true SOLO si vas a seguir trabajando en OTRA cosa mientras corren (los resultados llegan como subagent-result y despiertan el turno). No esperes con sleeps; subagents_status da el estado.",
 		],
 		parameters: Type.Object({
 			tasks: Type.Array(
@@ -1609,11 +1643,24 @@ export function installSubagents(pi: ExtensionAPI, runtime = createSubagentsRunt
 			background: Type.Optional(
 				Type.Boolean({
 					description:
-						"si true, retorna YA con {dispatched, note}; los resultados llegan como mensajes subagent-result (default false: foreground)",
+						"SOLO si vas a seguir con otra cosa mientras corren: retorna YA con {dispatched, note} y los resultados llegan como subagent-result. Para 'lanzá y reportame' usá el default (false: foreground, bloquea y devuelve resultados)",
 				}),
 			),
 		}),
 		async execute(_toolCallId, params, signal, onUpdate) {
+			if (utilityRun) {
+				// Sesión de utilería del engine (titulado): el prompt embebe la tarea
+				// del usuario y el modelo barato intenta ejecutarla (incidente
+				// 2026-08-19, dos batches fantasma). Acá no se spawnea nada.
+				return {
+					content: [
+						{
+							type: "text",
+							text: "subagents: deshabilitados en sesiones de utilería (titulado). Respondé SOLO lo pedido por el prompt de utilería.",
+						},
+					],
+				};
+			}
 			if (params.background) {
 				const dispatched = await runtime.dispatchBackground(params.tasks, {
 					signal,
