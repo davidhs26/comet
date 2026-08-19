@@ -149,6 +149,11 @@ enum TranscriptRowBuilder {
         for (ix, part) in entry.parts.enumerated() {
             switch part {
             case .tool(_, let call, let isError, let resolved, let subagent):
+                // The `todo` part IS the status strip's HUD chip (ID01-503)
+                // — rendering it here too would duplicate it, so the phone
+                // skips it. The original set_todos/update_todo calls are
+                // untouched: they keep folding as common tools below.
+                guard call.tag != "todo" else { continue }
                 pendingTools.append(ToolItem(call: call, isError: isError, resolved: resolved,
                                              subagent: subagent))
                 if ix == lastPartIx { flushTools(lastIx: ix) }
