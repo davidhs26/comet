@@ -215,15 +215,63 @@ fn cheapest_model(models: &[Model]) -> Option<String> {
     small.or(models.last()).map(|m| m.id.clone())
 }
 
-/// First line, stripped of quote/heading dressing, capped at 60 chars.
+/// Best title-looking line, stripped of dressing, capped at 60 chars.
+///
+/// La primera línea gana si ya parece un título (modelo bien portado). Si es
+/// una oración — un modelo que narra su plan antes de responder (con
+/// utility-guard bloqueándole las tools, ID01-491) deja el título al FINAL
+/// del texto — se toma la ÚLTIMA línea con pinta de título. Fallback: la
+/// primera línea truncada (comportamiento previo).
 fn clean_title(raw: &str) -> String {
-    let first = raw.trim().lines().next().unwrap_or("");
-    first
-        .trim_start_matches(['"', '\'', '#', ' ', '\t'])
-        .trim_end_matches(['"', '\'', ' ', '\t'])
-        .chars()
-        .take(60)
-        .collect()
+    // Pela comillas, headings y dressing de markdown (bullets, quotes, code):
+    // con el escaneo multi-línea CUALQUIER línea es candidata, no solo la 1ª.
+    fn strip(line: &str) -> &str {
+        line.trim()
+            .trim_start_matches(['"', '\'', '#', '-', '*', '>', '`', ' ', '\t'])
+            .trim_end_matches(['"', '\'', '`', '*', ' ', '\t'])
+    }
+    // Puntuación terminal/inicial de oración — un título legítimo con punto
+    // final ("Fix login roto.") se acepta PELADO, no se descarta (review k3).
+    fn strip_punct(l: &str) -> &str {
+        l.trim_start_matches(['\u{00bf}', '\u{00a1}'])
+            .trim_end_matches(['.', '!', '?', ':', ',', '\u{2026}'])
+            .trim()
+    }
+    fn looks_like_title(l: &str) -> bool {
+        let words = l.split_whitespace().count();
+        (1..=8).contains(&words) && l.chars().count() <= 60
+    }
+    fn ends_with_punct(l: &str) -> bool {
+        l.ends_with(['.', '!', '?', ':', ',', '\u{2026}'])
+    }
+    let lines: Vec<&str> = raw.lines().map(strip).filter(|l| !l.is_empty()).collect();
+    let pick = match lines.first() {
+        None => "",
+        // 1ª línea gana si parece título una vez pelada la puntuación — el
+        // preámbulo del incidente (13 palabras) sigue cayendo al escaneo.
+        Some(first) if looks_like_title(strip_punct(first)) => strip_punct(first),
+        Some(first) => {
+            // Escaneo en DOS pasadas (review k3): la puntuación terminal es
+            // LA señal que separa título de narración — una despedida corta
+            // ("¡Espero que sirva!") no debe ganarle al título real. La
+            // pasada laxa (pelada) solo rescata un título con signos
+            // ("¿Arreglar login roto?") cuando ninguna línea calificó.
+            let strict = lines
+                .iter()
+                .rev()
+                .find(|l| !ends_with_punct(l) && looks_like_title(strip_punct(l)));
+            match strict {
+                Some(l) => strip_punct(l),
+                None => lines
+                    .iter()
+                    .rev()
+                    .map(|l| strip_punct(l))
+                    .find(|l| looks_like_title(l))
+                    .unwrap_or(first),
+            }
+        }
+    };
+    pick.chars().take(60).collect()
 }
 
 /// Drive one titling run through the harness: no steering, questions resolved
@@ -299,5 +347,41 @@ mod tests {
         assert_eq!(clean_title("\"Fix Login Flow\"\nextra"), "Fix Login Flow");
         assert_eq!(clean_title("# Add Dark Mode  "), "Add Dark Mode");
         assert_eq!(clean_title("   "), "");
+    }
+
+    #[test]
+    fn first_line_title_with_terminal_punctuation_wins_stripped() {
+        // Review k3: el código viejo usaba "Fix login roto." tal cual; el
+        // escaneo NO debe saltearla y elegir un bullet posterior.
+        let raw = "Fix login roto.\n\n- Actualicé el utility-guard\n- Tests en verde";
+        assert_eq!(clean_title(raw), "Fix login roto");
+        // Español con signos: pelados, no descartados.
+        assert_eq!(clean_title("\u{00bf}Arreglar login roto?"), "Arreglar login roto");
+    }
+
+    #[test]
+    fn preamble_before_blocked_tools_yields_the_trailing_title() {
+        // Incidente 2026-08-19: el modelo narró su plan, utility-guard le
+        // bloqueó las tools, y recién al final respondió el título.
+        let raw = "Vamos por partes. Primero leo los dos archivos a editar y la golden suite.\n\nRol Specify Para Flota";
+        assert_eq!(clean_title(raw), "Rol Specify Para Flota");
+    }
+
+    #[test]
+    fn farewell_after_the_title_does_not_win() {
+        // Review k3 round 3: la despedida cortés califica pelada — la pasada
+        // estricta (sin puntuación) debe preferir el título real.
+        let raw = "Vamos por partes. Primero leo los archivos que me pediste revisar hoy.\n\nRol Specify Para Flota\n\n\u{00a1}Espero que sirva!";
+        assert_eq!(clean_title(raw), "Rol Specify Para Flota");
+        // Negrita: el cierre ** no queda colgando.
+        assert_eq!(clean_title("**Rol Specify Para Flota**"), "Rol Specify Para Flota");
+    }
+
+    #[test]
+    fn sentence_only_text_falls_back_to_first_line_capped() {
+        let raw = "Esta es una oración larga que no parece un título porque termina con punto y tiene demasiadas palabras para serlo.";
+        let t = clean_title(raw);
+        assert!(t.starts_with("Esta es una oración larga"));
+        assert!(t.chars().count() <= 60);
     }
 }
