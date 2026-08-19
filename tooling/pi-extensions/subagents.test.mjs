@@ -19,7 +19,7 @@ process.env.PI_SUBAGENTS_TRANSCRIPT_ROOT = path.join(os.tmpdir(), "pi-subagents-
 
 const here = import.meta.dirname;
 const mod = await import(url.pathToFileURL(path.join(here, "subagents.ts")).href);
-const { resolveRoute, canSpawn, assertReviewerDistinct, trimTail, createSubagentsRuntime, ROUTES, modelKey, chooseDeliverAs, formatSubagentResult, installSubagents, sumUsage, usageFromSessionJsonl, parseMaxCostUsd, formatBatchSummary, effectiveTimeoutMs, ROLE_TIMEOUT_FLOOR_MS, resolveChildMode, resolveTranscriptRoot, DEFAULT_TRANSCRIPT_ROOT, SESSION_DIR_RM_DELAY_MS, childSessionIdFor, formatSpawnedLine, formatFinishedLine, finishStatusFor } = mod;
+const { resolveRoute, canSpawn, assertReviewerDistinct, trimTail, createSubagentsRuntime, ROUTES, modelKey, chooseDeliverAs, formatSubagentResult, installSubagents, sumUsage, usageFromSessionJsonl, parseMaxCostUsd, formatBatchSummary, effectiveTimeoutMs, ROLE_TIMEOUT_FLOOR_MS, resolveChildMode, resolveTranscriptRoot, DEFAULT_TRANSCRIPT_ROOT, SESSION_DIR_RM_DELAY_MS, childSessionIdFor, formatSpawnedLine, formatFinishedLine, finishStatusFor, resolveInactivityMs, INACTIVITY_TIMEOUT_MS } = mod;
 
 let passed = 0;
 const failures = [];
@@ -279,15 +279,15 @@ await test("timeout: TERM ignorado → KILL → exitCode ≠ 0 y el batch sigue"
 	assert.equal(results.find((r) => r.id === "fast").exitCode, 0, "un fallo no tumba el batch");
 });
 
-// ---------- pisos de timeout por rol (directiva 2026-08-18) ----------
+// ---------- pisos del CAP duro por rol (ID01-484: la inactividad es el asesino primario) ----------
 await test("effectiveTimeoutMs: clamp al piso del rol; sin pedido usa default", () => {
-	assert.equal(effectiveTimeoutMs("review", 300_000), 600_000, "review no puede bajar de 10 min");
-	assert.equal(effectiveTimeoutMs("implement", 300_000), 900_000, "implement no puede bajar de 15 min");
-	assert.equal(effectiveTimeoutMs("grunt", 60_000), 300_000, "grunt no puede bajar de 5 min");
-	assert.equal(effectiveTimeoutMs("review", 1_200_000), 1_200_000, "subir sí se puede");
-	assert.equal(effectiveTimeoutMs("grunt", undefined), 900_000, "sin pedido → default 15 min");
+	assert.equal(effectiveTimeoutMs("review", 300_000), 1_800_000, "review no puede bajar de 30 min");
+	assert.equal(effectiveTimeoutMs("implement", 300_000), 3_600_000, "implement no puede bajar de 60 min");
+	assert.equal(effectiveTimeoutMs("grunt", 60_000), 900_000, "grunt no puede bajar de 15 min");
+	assert.equal(effectiveTimeoutMs("review", 2_400_000), 2_400_000, "subir sí se puede");
+	assert.equal(effectiveTimeoutMs("grunt", undefined), 900_000, "sin pedido → max(default, piso)");
 	assert.equal(effectiveTimeoutMs("review", 25, {}), 25, "floors {} deshabilita el clamp (tests)");
-	assert.equal(ROLE_TIMEOUT_FLOOR_MS.hard, 900_000);
+	assert.equal(ROLE_TIMEOUT_FLOOR_MS.hard, 3_600_000);
 });
 
 // ---------- heartbeat (directiva 2026-08-18: reporte ≤25s) ----------
@@ -1481,6 +1481,141 @@ await test("delay-rm: NO inmediato tras el finish; sí tras sessionRmDelayMs", a
 	assert.equal(rms.length, 0, "no inmediato: el engine drena el JSONL primero");
 	await tick(150);
 	assert.ok(rms.some((d) => d.includes(`${path.sep}zz-`)), `delay-rm: ${JSON.stringify(rms)}`);
+});
+
+// ---------- ID01-484: timeout por inactividad, no por reloj ----------
+
+await test("484: hijo que EMITE más allá del pedido lowball del LLM no muere (el piso protege el cap)", async () => {
+	// Regresión ID01-482: el orquestador pasaba exactamente el piso viejo y el
+	// hijo moría trabajando. Con pisos-de-cap generosos, el pedido bajo se
+	// clampea y la actividad sostiene al hijo.
+	const fake = makeFakeSpawn();
+	const rt = createSubagentsRuntime({
+		spawnFn: fake.spawnFn,
+		piBin: "/fake/pi",
+		sessionRoot: "/fake/s",
+		mkdirSessionDir: () => {},
+		rmSessionDir: () => {},
+		timeoutFloorsMs: { grunt: 300 },
+		inactivityMs: 5_000,
+	});
+	const batch = rt.runBatch([{ id: "worker", role: "grunt", prompt: "p", timeoutMs: 80 }]);
+	await tick();
+	const proc = fake.procs[0];
+	const feeder = setInterval(() => {
+		if (!proc.exited) fake.emitRpc(proc, { type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "." } });
+	}, 20);
+	await tick(150); // ya pasó el pedido de 80ms; el cap real es 300 (piso)
+	assert.equal(proc.exited, false, "sigue vivo pasado el pedido lowball");
+	clearInterval(feeder);
+	fake.emitRpc(proc, { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "listo" }] } });
+	fake.emitRpc(proc, { type: "agent_settled" });
+	const [r] = await batch;
+	assert.equal(r.exitCode, 0, "terminó bien: la actividad lo sostuvo dentro del cap");
+});
+
+await test("484: hijo MUDO muere por inactividad con diagnóstico distinguible", async () => {
+	const fake = makeFakeSpawn();
+	const rt = createSubagentsRuntime({
+		spawnFn: fake.spawnFn,
+		piBin: "/fake/pi",
+		sessionRoot: "/fake/s",
+		mkdirSessionDir: () => {},
+		rmSessionDir: () => {},
+		timeoutFloorsMs: {},
+		inactivityMs: 60,
+		killGraceMs: 30,
+	});
+	const batch = rt.runBatch([{ id: "mudo", role: "grunt", prompt: "p", timeoutMs: 30_000 }]);
+	await tick();
+	const proc = fake.procs[0];
+	fake.emitRpc(proc, { type: "response", command: "prompt", success: true }); // un evento y silencio
+	const [r] = await batch; // inactividad → abort → reap → exit
+	assert.equal(r.exitCode, 124);
+	assert.ok(r.output.includes("INACTIVIDAD"), `diagnóstico de cuelgue: ${r.output.slice(-160)}`);
+	assert.ok(!r.output.includes("cap duro"), "no confunde la causa");
+});
+
+await test("484: parlanchín infinito muere al CAP con diagnóstico de cap", async () => {
+	const fake = makeFakeSpawn();
+	const rt = createSubagentsRuntime({
+		spawnFn: fake.spawnFn,
+		piBin: "/fake/pi",
+		sessionRoot: "/fake/s",
+		mkdirSessionDir: () => {},
+		rmSessionDir: () => {},
+		timeoutFloorsMs: {},
+		inactivityMs: 500,
+		killGraceMs: 30,
+	});
+	const batch = rt.runBatch([{ id: "loop", role: "grunt", prompt: "p", timeoutMs: 120 }]);
+	await tick();
+	const proc = fake.procs[0];
+	const feeder = setInterval(() => {
+		if (!proc.exited) fake.emitRpc(proc, { type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "x" } });
+	}, 15);
+	const [r] = await batch; // cap 120ms pese a la actividad constante
+	clearInterval(feeder);
+	assert.equal(r.exitCode, 124);
+	assert.ok(r.output.includes("cap duro"), `diagnóstico de cap: ${r.output.slice(-160)}`);
+	assert.ok(!r.output.includes("INACTIVIDAD"), "no confunde la causa");
+});
+
+// ---------- ID01-484 round 2 (hallazgos del review k3) ----------
+
+await test("484r2: resolveInactivityMs — knob PI_SUBAGENTS_INACTIVITY_MS (0 deshabilita; inválido → default)", () => {
+	assert.equal(resolveInactivityMs({}), INACTIVITY_TIMEOUT_MS, "sin env → default");
+	assert.equal(resolveInactivityMs({ PI_SUBAGENTS_INACTIVITY_MS: "120000" }), 120_000, "env válido manda");
+	assert.equal(resolveInactivityMs({ PI_SUBAGENTS_INACTIVITY_MS: "0" }), 0, "0 = deshabilitar");
+	assert.equal(resolveInactivityMs({ PI_SUBAGENTS_INACTIVITY_MS: "banana" }), INACTIVITY_TIMEOUT_MS, "inválido → default");
+	assert.equal(resolveInactivityMs({ PI_SUBAGENTS_INACTIVITY_MS: "-5" }), INACTIVITY_TIMEOUT_MS, "negativo → default");
+	assert.equal(resolveInactivityMs({ PI_SUBAGENTS_INACTIVITY_MS: "" }), INACTIVITY_TIMEOUT_MS, "vacío → default");
+});
+
+await test("484r2: tool en vuelo exime de inactividad — el silencio de un cargo build no mata; el cap sí", async () => {
+	const fake = makeFakeSpawn();
+	const rt = createSubagentsRuntime({
+		spawnFn: fake.spawnFn,
+		piBin: "/fake/pi",
+		sessionRoot: "/fake/s",
+		mkdirSessionDir: () => {},
+		rmSessionDir: () => {},
+		timeoutFloorsMs: {},
+		inactivityMs: 60,
+		killGraceMs: 30,
+	});
+	const batch = rt.runBatch([{ id: "builder", role: "grunt", prompt: "p", timeoutMs: 400 }]);
+	await tick();
+	const proc = fake.procs[0];
+	fake.emitRpc(proc, { type: "tool_execution_start", toolName: "bash" }); // tool arranca y enmudece
+	await tick(200); // 200ms de silencio ≫ inactivityMs=60
+	assert.equal(proc.exited, false, "el silencio dentro del tool NO dispara inactividad");
+	const [r] = await batch; // el cap (400ms) lo corta
+	assert.equal(r.exitCode, 124);
+	assert.ok(r.output.includes("cap duro"), `lo mató el cap, no la inactividad: ${r.output.slice(-160)}`);
+	assert.ok(!r.output.includes("INACTIVIDAD"), "no confunde la causa");
+});
+
+await test("484r2: toolcall_end re-arma la inactividad — silencio POST-tool sí mata", async () => {
+	const fake = makeFakeSpawn();
+	const rt = createSubagentsRuntime({
+		spawnFn: fake.spawnFn,
+		piBin: "/fake/pi",
+		sessionRoot: "/fake/s",
+		mkdirSessionDir: () => {},
+		rmSessionDir: () => {},
+		timeoutFloorsMs: {},
+		inactivityMs: 60,
+		killGraceMs: 30,
+	});
+	const batch = rt.runBatch([{ id: "posttool", role: "grunt", prompt: "p", timeoutMs: 30_000 }]);
+	await tick();
+	const proc = fake.procs[0];
+	fake.emitRpc(proc, { type: "tool_execution_start", toolName: "bash" });
+	fake.emitRpc(proc, { type: "message_update", assistantMessageEvent: { type: "toolcall_end", toolCall: { name: "bash" } } });
+	const [r] = await batch; // tool cerrado + silencio → inactividad
+	assert.equal(r.exitCode, 124);
+	assert.ok(r.output.includes("INACTIVIDAD"), `cuelgue post-tool detectado: ${r.output.slice(-160)}`);
 });
 
 console.log(`\n${passed} passed, ${failures.length} failed`);

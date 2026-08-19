@@ -1167,12 +1167,30 @@ impl WorkspaceHostInner {
     /// Returns `true` when this tick fired a redial escalation — the CALLER
     /// invokes the deaf-escalation hook after releasing its guards (the hook
     /// reaches DocHost, whose lock order must not nest under room/reg).
+    /// ID01-483 (2026-08-19): default OFF. Upstream v0.2.10 supersedió este
+    /// tripwire (claim-on-HTTP first-contact, pull-first HTTPS, cursor
+    /// amnesty, redial resiliente): sobre el stack nuevo la heurística
+    /// disparaba en falso y su redial + sweep interrumpía la publicación de
+    /// docs cada 1-7 min con la app mirando ("las actualizaciones no fluyen").
+    /// Re-habilitable con ZERON_DEAF_TRIPWIRE=1 mientras se evalúa retirarlo
+    /// del todo.
+    fn deaf_tripwire_enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var("ZERON_DEAF_TRIPWIRE")
+                .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        })
+    }
+
     fn check_presence_deafness(
         &self,
         room: &RegistryClient,
         live_fresh_peers: usize,
         now: i64,
     ) -> bool {
+        if !Self::deaf_tripwire_enabled() {
+            return false;
+        }
         let action = lock(&self.presence_watch).tick(live_fresh_peers, now);
         match action {
             DeafAction::None => false,

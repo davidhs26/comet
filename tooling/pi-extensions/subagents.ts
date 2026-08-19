@@ -78,21 +78,26 @@ export function modelKey(route: Route): string {
 }
 
 /**
- * Piso de timeout por rol (directiva David 2026-08-18): el orquestador LLM no
- * puede elegir un timeout menor al piso — reviews @ high e implementaciones
- * reales tardan minutos y matarlas a los 5 min producía "subagentes mudos"
- * (exit 124 con output vacío: en modo -p el output se emite recién al final).
+ * Pisos por rol del CAP DURO (ID01-484, 2026-08-19): el orquestador LLM no
+ * puede pedir un cap menor al piso. NO son timeouts de ejecución: el asesino
+ * primario en modo rpc es la INACTIVIDAD (abajo) — un hijo que emite eventos
+ * está trabajando y no se mata por reloj. Los valores anteriores
+ * (900/600/300, directiva 2026-08-18) actuaban como timeout efectivo y
+ * mataron a los tres hijos de la sesión ID01-482 en pleno trabajo (cargo
+ * tests, review de diff Rust) — todos exit 124 con output parcial probándolo.
  */
 export const ROLE_TIMEOUT_FLOOR_MS: Record<Role, number> = {
-	implement: 900_000,
-	hard: 900_000,
-	review: 600_000,
-	research: 300_000,
-	grunt: 300_000,
+	implement: 3_600_000,
+	hard: 3_600_000,
+	review: 1_800_000,
+	research: 900_000,
+	grunt: 900_000,
 };
 
 /**
  * Timeout efectivo de un task: max(pedido, piso del rol). Sin pedido → default.
+ * En modo print sigue siendo EL timeout; en rpc es solo el CAP DURO (la
+ * inactividad corta antes si el hijo se cuelga de verdad).
  */
 export function effectiveTimeoutMs(
 	role: Role,
@@ -101,6 +106,26 @@ export function effectiveTimeoutMs(
 ): number {
 	const floor = floors[role] ?? 0;
 	return Math.max(requested ?? DEFAULT_TIMEOUT_MS, floor);
+}
+
+/**
+ * Inactividad (solo rpc): si el hijo pasa este tiempo sin emitir NINGÚN
+ * evento parseado, se lo da por colgado. Se chequea con un interval barato
+ * (sin churn de timers por delta). Un tool call en vuelo exime del corte:
+ * ese silencio lo cubre el cap duro, no la inactividad.
+ */
+export const INACTIVITY_TIMEOUT_MS = 600_000;
+
+/** Knob operativo: PI_SUBAGENTS_INACTIVITY_MS (0 = deshabilitar; inválido → default). */
+export function resolveInactivityMs(
+	env: Record<string, string | undefined> = process.env,
+): number {
+	const raw = env.PI_SUBAGENTS_INACTIVITY_MS;
+	if (raw !== undefined && raw !== "") {
+		const n = Number(raw);
+		if (Number.isFinite(n) && n >= 0) return n;
+	}
+	return INACTIVITY_TIMEOUT_MS;
 }
 
 /**
@@ -571,6 +596,8 @@ export interface RuntimeDeps {
 	childMode?: ChildMode;
 	/** Throttle de updates inmediatos por cambio de actividad (ID01-461). */
 	activityThrottleMs?: number;
+	/** Inactividad rpc: ms sin eventos del hijo antes de darlo por colgado. */
+	inactivityMs?: number;
 	/** Gracia post-settle antes de cerrar el task rpc (0 = cerrar al primer settle). */
 	settleGraceMs?: number;
 	/**
@@ -615,6 +642,7 @@ export function createSubagentsRuntime(deps: RuntimeDeps = {}) {
 	const childMode: ChildMode = resolveChildMode(deps, deps.env ?? process.env);
 	const activityThrottleMs: number = deps.activityThrottleMs ?? ACTIVITY_THROTTLE_MS;
 	const settleGraceMs: number = deps.settleGraceMs ?? SETTLE_GRACE_MS;
+	const inactivityMs: number = deps.inactivityMs ?? resolveInactivityMs(deps.env ?? process.env);
 	const settleGraceProbe: (cwd: string) => boolean =
 		deps.settleGraceProbe ??
 		((cwd) => {
@@ -779,6 +807,15 @@ export function createSubagentsRuntime(deps: RuntimeDeps = {}) {
 			// rpc: ¿llegó AL MENOS un evento JSON? Si no y el hijo falló, casi seguro
 			// el pi instalado no soporta --mode rpc → hint accionable en el output.
 			let sawRpcEvent = false;
+			// Inactividad (ID01-484): un hijo que emite está vivo; solo el silencio
+			// total mata. Marca de último evento + interval de chequeo barato.
+			let lastEventAt = now();
+			let inactivityFired = false;
+			let inactivityCheck: ReturnType<typeof setInterval> | undefined;
+			// Tool en vuelo (tool_execution_start sin cerrar): puede ser
+			// legítimamente mudo (cargo build sin stream de output) — ese silencio
+			// lo cubre el cap duro, no la inactividad (review k3 de ID01-484).
+			let toolInFlight = false;
 			// rpc: mensajes assistant ya cerrados + buffer de deltas del mensaje en
 			// curso. El output final los concatena (un turno puede tener varios).
 			const finalParts: string[] = [];
@@ -790,6 +827,7 @@ export function createSubagentsRuntime(deps: RuntimeDeps = {}) {
 				settled = true;
 				if (timer) clearTimeout(timer);
 				if (settleTimer) clearTimeout(settleTimer);
+				if (inactivityCheck) clearInterval(inactivityCheck);
 				for (const t of localKills) {
 					clearTimeout(t);
 					pendingKills.delete(t);
@@ -886,11 +924,15 @@ export function createSubagentsRuntime(deps: RuntimeDeps = {}) {
 				}
 				if (!ev || typeof ev !== "object") return;
 				sawRpcEvent = true;
+				lastEventAt = now();
 				// CUALQUIER evento que no sea el settle es señal de trabajo vivo y
 				// cancela un cierre en gracia (whitelist estrecha = cerrar a mitad de
 				// una reparación de verify-gate y reportar exit 0 — hallazgo del review).
 				if (ev.type !== "agent_settled") cancelPendingSettle();
 				if (ev.type === "message_start" && (ev.message as { role?: unknown } | undefined)?.role === "assistant") {
+					// El assistant volvió a streamear ⇒ la fase de tools terminó
+					// (red de seguridad por si un pi no emite tool_execution_end).
+					toolInFlight = false;
 					// SOLO assistant: es el retry de pi tras un error transitorio (429),
 					// que sin esto reportaría exit 1 con output bueno. Un message_start
 					// de role user (reinyección de verify-gate) NO limpia el error: si el
@@ -910,6 +952,7 @@ export function createSubagentsRuntime(deps: RuntimeDeps = {}) {
 							setActivity(activityFromText(deltaBuf));
 						}
 					} else if (ame.type === "toolcall_end") {
+						toolInFlight = false;
 						const name = (ame.toolCall as { name?: unknown } | undefined)?.name;
 						if (typeof name === "string") setActivity(`⚙ ${name}`);
 					} else if (ame.type === "error") {
@@ -936,8 +979,12 @@ export function createSubagentsRuntime(deps: RuntimeDeps = {}) {
 						setActivity(activityFromText(text));
 					}
 				} else if (ev.type === "tool_execution_start" && typeof ev.toolName === "string") {
+					toolInFlight = true;
 					setActivity(`⚙ ${ev.toolName}`);
+				} else if (ev.type === "tool_execution_end") {
+					toolInFlight = false;
 				} else if (ev.type === "agent_settled") {
+					toolInFlight = false;
 					// Fin del turno (sin retry/compaction/continuación pendiente).
 					// NO cerramos de una: una extensión del hijo (verify-gate) puede
 					// reinyectar un turno de reparación justo después. Esperamos la
@@ -1003,7 +1050,8 @@ export function createSubagentsRuntime(deps: RuntimeDeps = {}) {
 					/* stdin roto → el handler de exit/error resuelve */
 				}
 			}
-			timer = setTimeout(() => {
+			const fireTimeout = (): void => {
+				if (settled || timedOut) return;
 				timedOut = true;
 				if (isRpc) {
 					// abort amable por el canal y recién después el ladder de señales:
@@ -1022,7 +1070,27 @@ export function createSubagentsRuntime(deps: RuntimeDeps = {}) {
 					}
 					scheduleKill(killGraceMs);
 				}
-			}, effectiveTimeoutMs(task.role, task.timeoutMs, timeoutFloorsMs));
+			};
+			// Cap duro (print: EL timeout; rpc: red final anti-runaway).
+			timer = setTimeout(fireTimeout, effectiveTimeoutMs(task.role, task.timeoutMs, timeoutFloorsMs));
+			if (isRpc && inactivityMs > 0) {
+				// Asesino primario en rpc: silencio total del stream. Interval de
+				// chequeo (≥3 muestras por ventana) en vez de resetear un timer por
+				// delta — mismo resultado, sin churn.
+				const checkEvery = Math.max(50, Math.min(30_000, Math.floor(inactivityMs / 3)));
+				inactivityCheck = setInterval(() => {
+					// closing/settleTimer: el silencio post-settle es ESPERADO (grace,
+					// espera de exit) — sin este guard, inactivityMs < graceMs (config
+					// de test) convertiría un settle exitoso en falso 124.
+					if (settled || timedOut || closing || settleTimer) return;
+					if (toolInFlight) return;
+					if (now() - lastEventAt > inactivityMs) {
+						inactivityFired = true;
+						fireTimeout();
+					}
+				}, checkEvery);
+				inactivityCheck.unref?.();
+			}
 			child.stdout?.on("data", (d: Buffer) => {
 				if (!isRpc) {
 					stdout = trimTail(stdout + d.toString("utf8"));
@@ -1090,10 +1158,16 @@ export function createSubagentsRuntime(deps: RuntimeDeps = {}) {
 				}
 				if (timedOut) {
 					const secs = Math.round(effectiveTimeoutMs(task.role, task.timeoutMs, timeoutFloorsMs) / 1000);
+					// Dos causas distintas piden dos diagnósticos distintos (ID01-484):
+					// silencio total = cuelgue probable; cap con actividad = runaway o
+					// task genuinamente enorme.
+					const rpcMsg = inactivityFired
+						? `subagents: cortado por INACTIVIDAD — ${Math.round(inactivityMs / 1000)}s sin ningún evento del hijo (cuelgue probable). El output parcial se conserva arriba.`
+						: `subagents: timeout tras ${secs}s (cap duro del rol) — si era trabajo legítimo, subí timeoutMs o partí la task en pasos más chicos. Output parcial arriba.`;
 					finish(
 						TIMEOUT_EXIT_CODE,
 						isRpc
-							? `subagents: timeout tras ${secs}s — el output parcial (stream rpc) se conserva arriba; la task probablemente seguía trabajando. Reintentá con timeoutMs mayor o partí la task en pasos más chicos.`
+							? rpcMsg
 							: `subagents: timeout tras ${secs}s — en modo -p el output se emite recién al final; la task probablemente seguía trabajando. Reintentá con timeoutMs mayor o partí la task en pasos más chicos.`,
 					);
 				} else {
@@ -1528,7 +1602,7 @@ export function installSubagents(pi: ExtensionAPI, runtime = createSubagentsRunt
 					cwd: Type.Optional(Type.String({ description: "directorio de trabajo; default cwd actual" })),
 					model: Type.Optional(Type.String({ description: 'override "provider/model", split en el primer "/"' })),
 					thinking: Type.Optional(ThinkingSchema),
-					timeoutMs: Type.Optional(Type.Number({ description: "timeout por task; default 900000 (15 min)" })),
+					timeoutMs: Type.Optional(Type.Number({ description: "CAP duro por task (no timeout de ejecución): un hijo colgado cae antes por inactividad (600s sin eventos). Clampeado al piso del rol (implement/hard 60min, review 30min, research/grunt 15min). Default: el piso del rol." })),
 				}),
 				{ minItems: 1 },
 			),
