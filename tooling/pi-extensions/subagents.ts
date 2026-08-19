@@ -241,6 +241,27 @@ export function canSpawn(env: NodeJS.ProcessEnv = process.env): boolean {
 	return !(depth >= 1); // Number("abc")=NaN → NaN>=1 es false → puede
 }
 
+/** Redacción congelada (ID01-487). */
+export const REVIEW_JURISDICTION_RULE =
+	"Solo pueden bloquear los problemas que la tarea actual introdujo o empeoró. La deuda preexistente se reporta en sección aparte, no-bloqueante, como candidata a issues.";
+
+/** Nombre canónico de la sección no-bloqueante (aceptación ID01-487). */
+export const REVIEW_PREEXISTING_SECTION = "deuda preexistente detectada";
+
+/**
+ * Prefijo inyectado al prompt del hijo review (print argv + rpc stdin).
+ * promptGuidelines de la tool solo lo ve el padre; el reviewer hijo no.
+ */
+export function wrapTaskPrompt(role: Role, prompt: string): string {
+	if (role !== "review") return prompt;
+	const prefix: string[] = [];
+	if (!prompt.includes(REVIEW_JURISDICTION_RULE)) prefix.push(REVIEW_JURISDICTION_RULE);
+	const sectionLine = `Sección canónica para deuda vieja: "${REVIEW_PREEXISTING_SECTION}". Esa deuda queda exceptuada de la reparación en la misma tanda.`;
+	if (!prompt.includes(REVIEW_PREEXISTING_SECTION)) prefix.push(sectionLine);
+	if (prefix.length === 0) return prompt;
+	return [...prefix, "", prompt].join("\n");
+}
+
 /**
  * Regla dura §7: si el batch mezcla review + implement, los MODELOS RESUELTOS
  * de revisor e implementador deben diferir (revisor ≠ implementador).
@@ -1329,7 +1350,7 @@ export function createSubagentsRuntime(deps: RuntimeDeps = {}) {
 				id: t.id ?? `t${i + 1}`,
 				role,
 				route: resolveRoute(role, t.model, t.thinking),
-				prompt: t.prompt,
+				prompt: wrapTaskPrompt(role, t.prompt),
 				cwd: t.cwd,
 				timeoutMs: t.timeoutMs,
 			};
@@ -1626,6 +1647,7 @@ export function installSubagents(pi: ExtensionAPI, runtime = createSubagentsRunt
 			"Usá subagents para subtareas independientes en paralelo en lugar de múltiples bash con `pi … &`; los prompts deben ser auto-contenidos y deterministas.",
 			"DEFAULT foreground: bloquea, streamea el progreso al usuario y devuelve los resultados en el mismo turno. Si el usuario pide 'lanzá X y reportame', eso es foreground.",
 			"background:true SOLO si vas a seguir trabajando en OTRA cosa mientras corren (los resultados llegan como subagent-result y despiertan el turno). No esperes con sleeps; subagents_status da el estado.",
+			"Rol review: Solo pueden bloquear los problemas que la tarea actual introdujo o empeoró. La deuda preexistente se reporta en sección aparte, no-bloqueante, como candidata a issues. La extensión inyecta esta regla en el prompt del hijo review (wrapTaskPrompt).",
 		],
 		parameters: Type.Object({
 			tasks: Type.Array(

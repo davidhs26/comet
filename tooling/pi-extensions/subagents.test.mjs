@@ -19,7 +19,7 @@ process.env.PI_SUBAGENTS_TRANSCRIPT_ROOT = path.join(os.tmpdir(), "pi-subagents-
 
 const here = import.meta.dirname;
 const mod = await import(url.pathToFileURL(path.join(here, "subagents.ts")).href);
-const { resolveRoute, canSpawn, assertReviewerDistinct, trimTail, createSubagentsRuntime, ROUTES, modelKey, chooseDeliverOpts, UTILITY_PROMPT_PREFIX, formatSubagentResult, installSubagents, sumUsage, usageFromSessionJsonl, parseMaxCostUsd, formatBatchSummary, effectiveTimeoutMs, ROLE_TIMEOUT_FLOOR_MS, resolveChildMode, resolveTranscriptRoot, DEFAULT_TRANSCRIPT_ROOT, SESSION_DIR_RM_DELAY_MS, childSessionIdFor, formatSpawnedLine, formatFinishedLine, finishStatusFor, resolveInactivityMs, INACTIVITY_TIMEOUT_MS } = mod;
+const { resolveRoute, canSpawn, assertReviewerDistinct, trimTail, createSubagentsRuntime, ROUTES, modelKey, chooseDeliverOpts, UTILITY_PROMPT_PREFIX, formatSubagentResult, installSubagents, sumUsage, usageFromSessionJsonl, parseMaxCostUsd, formatBatchSummary, effectiveTimeoutMs, ROLE_TIMEOUT_FLOOR_MS, resolveChildMode, resolveTranscriptRoot, DEFAULT_TRANSCRIPT_ROOT, SESSION_DIR_RM_DELAY_MS, childSessionIdFor, formatSpawnedLine, formatFinishedLine, finishStatusFor, resolveInactivityMs, INACTIVITY_TIMEOUT_MS, wrapTaskPrompt, REVIEW_JURISDICTION_RULE, REVIEW_PREEXISTING_SECTION } = mod;
 
 let passed = 0;
 const failures = [];
@@ -146,6 +146,22 @@ await test("thinking override explícito", () => {
 	assert.equal(resolveRoute("implement", undefined, "high").thinking, "high");
 });
 
+// ---------- wrapTaskPrompt (ID01-487) ----------
+await test("wrapTaskPrompt: review antepone la regla exacta; otros roles no tocan", () => {
+	assert.equal(wrapTaskPrompt("grunt", "hola"), "hola");
+	assert.equal(wrapTaskPrompt("implement", "hola"), "hola");
+	const wrapped = wrapTaskPrompt("review", "mirá el diff");
+	assert.ok(wrapped.startsWith(REVIEW_JURISDICTION_RULE), "redacción exacta al inicio");
+	assert.ok(wrapped.includes(REVIEW_PREEXISTING_SECTION), "nombre canónico de sección");
+	assert.ok(wrapped.endsWith("mirá el diff"), "prompt original al final");
+	assert.notEqual(wrapped, "mirá el diff");
+	assert.equal(wrapTaskPrompt("review", wrapped), wrapped, "idempotente si ya está la regla");
+	const onlyRule = REVIEW_JURISDICTION_RULE + "\n\nmirá";
+	const topped = wrapTaskPrompt("review", onlyRule);
+	assert.ok(topped.includes(REVIEW_PREEXISTING_SECTION), "si solo está la regla, agrega la sección");
+	assert.equal((topped.match(new RegExp(REVIEW_JURISDICTION_RULE.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g")) || []).length, 1, "no duplica la regla");
+});
+
 // ---------- canSpawn ----------
 await test("canSpawn: depth <1 ok, >=1 rechaza, basura tolerada", () => {
 	assert.equal(canSpawn({}), true);
@@ -250,7 +266,7 @@ await test("spawn args: PI absoluto + --session-dir (no --no-session) + env hijo
 		"--provider", "kimi-coding",
 		"--model", "k3",
 		"--thinking", "high",
-		"-p", "--session-dir", path.join("/fake/sessions", `t1-${process.pid}-5000-1`), "mirá",
+		"-p", "--session-dir", path.join("/fake/sessions", `t1-${process.pid}-5000-1`), wrapTaskPrompt("review", "mirá"),
 	]);
 	assert.ok(!fake.argss[0].includes("--no-session"), "434: ya no se pasa --no-session");
 	assert.equal(proc.spawnOpts.env.PI_SUBAGENT_DEPTH, "1");
@@ -1004,7 +1020,7 @@ await test("rpc feliz: prompt por stdin, args sin -p, output acumulado, exit 0",
 	]);
 	assert.ok(!fake.argss[0].includes("-p"), "rpc: sin -p ni prompt por argv");
 	assert.equal(proc.spawnOpts.stdio[0], "pipe", "rpc: stdin ES el canal");
-	assert.equal(proc.stdinWrites[0], `${JSON.stringify({ type: "prompt", message: "mirá esto" })}\n`);
+	assert.equal(proc.stdinWrites[0], `${JSON.stringify({ type: "prompt", message: wrapTaskPrompt("review", "mirá esto") })}\n`);
 	fake.emitRpc(proc, { type: "response", command: "prompt", success: true }); // ack
 	fake.emitRpc(proc, { type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "primer chunk " } });
 	fake.emitRpc(proc, { type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "segundo chunk" } });
