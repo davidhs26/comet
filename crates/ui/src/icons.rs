@@ -113,6 +113,9 @@ icon_assets![
     (INFO_CIRCLE, "info-circle"),
     (DANGER_TRIANGLE, "danger-triangle"),
     (CHAT_ROUND_LINE, "chat-round-line"),
+    // Hand-drawn bot head (antenna + eyes + ears) in the Solar Linear style
+    // — the embedded set has no bot/robot glyph. Subagent tabs.
+    (BOT, "bot"),
     // Hand-drawn bell + speaker in the Solar Linear style (like the terminal/
     // plus/return ports) — the embedded set has neither.
     (BELL, "bell"),
@@ -122,6 +125,18 @@ icon_assets![
     (TERMINAL, "terminal"),
     (PLUS, "plus"),
     (CLOSE, "close"),
+    // Hand-drawn Linux caption glyphs (minimize dash, maximize square,
+    // restore stacked squares) in the same style as `close` — drawn for the
+    // client-side-decoration window controls; no system glyph font exists on
+    // Linux the way Segoe Fluent Icons does on Windows.
+    (WINDOW_MINIMIZE, "window-minimize"),
+    (WINDOW_MAXIMIZE, "window-maximize"),
+    (WINDOW_RESTORE, "window-restore"),
+    // Hand-drawn hard-drive + home glyphs in the Solar Linear style (like the
+    // terminal/plus/return ports) — drawn for the add-space palette's
+    // Locations rail; the set has neither.
+    (HARD_DRIVE, "hard-drive"),
+    (HOME, "home"),
     (STOP, "stop"),
     (CHECK, "check"),
     (COPY, "copy"),
@@ -138,6 +153,7 @@ icon_assets![
     (GROK_MARK, "grok-mark"),
     (HERMES_MARK, "hermes-mark"),
     (PI_MARK, "pi-mark"),
+    (OPENCODE_MARK, "opencode-mark"),
 ];
 
 /// The Claude mark's brand orange (`#D97757`) — zeron keeps it even on the
