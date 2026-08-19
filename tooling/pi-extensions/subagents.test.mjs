@@ -5,6 +5,7 @@
  */
 import { strict as assert } from "node:assert";
 import { EventEmitter } from "node:events";
+import * as os from "node:os";
 import * as path from "node:path";
 import * as url from "node:url";
 
@@ -12,9 +13,13 @@ import * as url from "node:url";
 // no inyectan env heredan process.env y canSpawn rechaza el batch.
 delete process.env.PI_SUBAGENT_DEPTH;
 
+// ID01-482: los runtimes SIN sessionRoot inyectado no deben crear dirs en el
+// homedir real (~/.pi/agent/subagent-transcripts) durante los tests.
+process.env.PI_SUBAGENTS_TRANSCRIPT_ROOT = path.join(os.tmpdir(), "pi-subagents-test");
+
 const here = import.meta.dirname;
 const mod = await import(url.pathToFileURL(path.join(here, "subagents.ts")).href);
-const { resolveRoute, canSpawn, assertReviewerDistinct, trimTail, createSubagentsRuntime, ROUTES, modelKey, chooseDeliverAs, formatSubagentResult, installSubagents, sumUsage, usageFromSessionJsonl, parseMaxCostUsd, formatBatchSummary, effectiveTimeoutMs, ROLE_TIMEOUT_FLOOR_MS, resolveChildMode } = mod;
+const { resolveRoute, canSpawn, assertReviewerDistinct, trimTail, createSubagentsRuntime, ROUTES, modelKey, chooseDeliverAs, formatSubagentResult, installSubagents, sumUsage, usageFromSessionJsonl, parseMaxCostUsd, formatBatchSummary, effectiveTimeoutMs, ROLE_TIMEOUT_FLOOR_MS, resolveChildMode, resolveTranscriptRoot, DEFAULT_TRANSCRIPT_ROOT, SESSION_DIR_RM_DELAY_MS, childSessionIdFor, formatSpawnedLine, formatFinishedLine, finishStatusFor } = mod;
 
 let passed = 0;
 const failures = [];
@@ -245,7 +250,7 @@ await test("spawn args: PI absoluto + --session-dir (no --no-session) + env hijo
 		"--provider", "kimi-coding",
 		"--model", "k3",
 		"--thinking", "high",
-		"-p", "--session-dir", path.join("/fake/sessions", `${process.pid}-5000-1`, "t1"), "mirá",
+		"-p", "--session-dir", path.join("/fake/sessions", `t1-${process.pid}-5000-1`), "mirá",
 	]);
 	assert.ok(!fake.argss[0].includes("--no-session"), "434: ya no se pasa --no-session");
 	assert.equal(proc.spawnOpts.env.PI_SUBAGENT_DEPTH, "1");
@@ -898,16 +903,18 @@ await test("role hard → payg true: envelope + summary + note background + tota
 	assert.equal(rt.status().totals.payg, true);
 });
 
-await test("rmSessionDir se llama aunque el child salga ≠ 0", async () => {
+await test("rmSessionDir se llama aunque el child salga ≠ 0 (delay-rm ID01-482)", async () => {
 	const rms = [];
 	const fake = makeFakeSpawn();
-	const rt = createSubagentsRuntime({ spawnFn: fake.spawnFn, mkdirSessionDir: () => {}, rmSessionDir: (d) => rms.push(d) });
+	const rt = createSubagentsRuntime({ spawnFn: fake.spawnFn, mkdirSessionDir: () => {}, rmSessionDir: (d) => rms.push(d), sessionRmDelayMs: 5 });
 	const batch = rt.runBatch([{ id: "bad", prompt: "x" }]);
 	await tick();
 	fake.finishProc(fake.procs[0], 3); // exit ≠ 0
 	const [r] = await batch;
 	assert.equal(r.exitCode, 3);
-	assert.ok(rms.some((d) => /[\\/]bad$/.test(d)), `task dir en ${JSON.stringify(rms)}`);
+	assert.equal(rms.length, 0, "ID01-482: el rm es diferido, no inmediato");
+	await tick(50);
+	assert.ok(rms.some((d) => /[\\/]bad-/.test(d)), `task dir en ${JSON.stringify(rms)}`);
 	assert.ok(rms.length >= 1);
 });
 
@@ -1374,6 +1381,106 @@ await test("PI_SUBAGENTS_MAX_COST_USD se relee por batch (no al crear el runtime
 	const r2 = await second;
 	assert.equal(fake.argss.length, 3, "con tope solo spawnó b1 (a1+a2+b1)");
 	assert.equal(r2[1].skipped, "budget");
+});
+
+// ---------- ID01-482: viz en la app (líneas machine-readable + transcriptRoot) ----------
+
+await test("resolveTranscriptRoot: deps.sessionRoot > PI_SUBAGENTS_TRANSCRIPT_ROOT > default", () => {
+	assert.equal(resolveTranscriptRoot({ sessionRoot: "/a" }, { PI_SUBAGENTS_TRANSCRIPT_ROOT: "/b" }), "/a");
+	assert.equal(resolveTranscriptRoot({}, { PI_SUBAGENTS_TRANSCRIPT_ROOT: "/b" }), "/b");
+	assert.equal(resolveTranscriptRoot({}, { PI_SUBAGENTS_TRANSCRIPT_ROOT: "  " }), DEFAULT_TRANSCRIPT_ROOT, "env vacío → default");
+	assert.equal(resolveTranscriptRoot({}, {}), DEFAULT_TRANSCRIPT_ROOT);
+	assert.ok(
+		DEFAULT_TRANSCRIPT_ROOT.endsWith(path.join(".pi", "agent", "subagent-transcripts")),
+		DEFAULT_TRANSCRIPT_ROOT,
+	);
+	assert.equal(SESSION_DIR_RM_DELAY_MS >= 2500, true, "cubre el drain del engine (6×200ms) + margen");
+});
+
+await test("childSessionIdFor + formatSpawnedLine/formatFinishedLine: formato congelado", () => {
+	assert.equal(childSessionIdFor("t1", "123-5000-1"), "t1-123-5000-1");
+	assert.equal(
+		formatSpawnedLine("t1", "research", "alibaba/qwen3.8-max", "t1-123-5000-1"),
+		"subagent_spawned: t1 role: research model: alibaba/qwen3.8-max child_session_id: t1-123-5000-1",
+	);
+	assert.equal(formatFinishedLine("t1", "interrupted"), "subagent_finished: t1 status: interrupted");
+});
+
+await test("finishStatusFor: 0→completed, 124→interrupted, 125/budget→interrupted, -1→error, otro→failed", () => {
+	assert.equal(finishStatusFor({ exitCode: 0 }), "completed");
+	assert.equal(finishStatusFor({ exitCode: 124 }), "interrupted");
+	assert.equal(finishStatusFor({ exitCode: 125, skipped: "budget" }), "interrupted");
+	assert.equal(finishStatusFor({ exitCode: -1 }), "error");
+	assert.equal(finishStatusFor({ exitCode: 3 }), "failed");
+});
+
+await test("runBatch: spawned/finished lines + sessionDir {transcriptRoot}/{id}-{batchKey} + progressLine en el mismo update", async () => {
+	const fake = makeFakeSpawn();
+	const updates = [];
+	const rt = createSubagentsRuntime({
+		spawnFn: fake.spawnFn,
+		piBin: "/fake/pi",
+		sessionRoot: "/fake/tr",
+		childMode: "print",
+		now: () => 7777,
+		mkdirSessionDir: () => {},
+		rmSessionDir: () => {},
+	});
+	const batch = rt.runBatch(
+		[{ id: "t1", role: "research", prompt: "a" }, { id: "t2", role: "research", prompt: "b" }],
+		{ onUpdate: (u) => updates.push(u.content[0].text) },
+	);
+	for (let i = 0; fake.procs.some((p) => !p.exited) && i < 40; i++) {
+		const pending = fake.procs.find((p) => !p.exited);
+		if (pending) fake.finishProc(pending, 0);
+		await tick();
+	}
+	const results = await batch;
+	const batchKey = `${process.pid}-7777-1`;
+	const machineLines = updates.flatMap((t) => t.split("\n").filter((l) => l.startsWith("subagent_")));
+	const spawned = machineLines.filter((l) => l.startsWith("subagent_spawned: "));
+	assert.deepEqual(spawned, [
+		`subagent_spawned: t1 role: research model: alibaba/qwen3.8-max child_session_id: t1-${batchKey}`,
+		`subagent_spawned: t2 role: research model: alibaba/qwen3.8-max child_session_id: t2-${batchKey}`,
+	], JSON.stringify(updates));
+	const finished = machineLines.filter((l) => l.startsWith("subagent_finished: "));
+	assert.deepEqual(finished.sort(), [
+		"subagent_finished: t1 status: completed",
+		"subagent_finished: t2 status: completed",
+	].sort());
+	// sessionDir: --session-dir = {transcriptRoot}/{child_session_id}
+	const dirs = fake.argss.map((a) => a[a.indexOf("--session-dir") + 1]);
+	assert.deepEqual(
+		[...dirs].sort(),
+		[path.join("/fake/tr", `t1-${batchKey}`), path.join("/fake/tr", `t2-${batchKey}`)].sort(),
+		JSON.stringify(dirs),
+	);
+	// finished viaja EN EL MISMO update que el progressLine humano
+	const t1done = updates.find((t) => t.includes("subagent_finished: t1"));
+	assert.match(t1done, /^subagents: t1\/2 done/);
+	// timeout → interrupted
+	assert.ok(results.every((r) => r.exitCode === 0));
+});
+
+await test("delay-rm: NO inmediato tras el finish; sí tras sessionRmDelayMs", async () => {
+	const fake = makeFakeSpawn();
+	const rms = [];
+	const rt = createSubagentsRuntime({
+		spawnFn: fake.spawnFn,
+		sessionRoot: "/fake/tr",
+		childMode: "print",
+		sessionRmDelayMs: 60,
+		mkdirSessionDir: () => {},
+		rmSessionDir: (d) => rms.push(d),
+	});
+	const batch = rt.runBatch([{ id: "zz", prompt: "x" }]);
+	await tick();
+	fake.finishProc(fake.procs[0], 3);
+	const [r] = await batch;
+	assert.equal(r.exitCode, 3);
+	assert.equal(rms.length, 0, "no inmediato: el engine drena el JSONL primero");
+	await tick(150);
+	assert.ok(rms.some((d) => d.includes(`${path.sep}zz-`)), `delay-rm: ${JSON.stringify(rms)}`);
 });
 
 console.log(`\n${passed} passed, ${failures.length} failed`);

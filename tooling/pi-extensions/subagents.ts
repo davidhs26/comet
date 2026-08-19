@@ -26,6 +26,13 @@
  * actividad rodante en el heartbeat y updates inmediatos throttlados.
  * `PI_SUBAGENTS_CHILD_MODE=print` vuelve al modo `-p` (fallback de emergencia).
  *
+ * v5 (ID01-482): viz en la app. Líneas machine-readable en los onUpdate del
+ * tool call (`subagent_spawned:` / `subagent_finished:`; el heartbeat humano
+ * queda intacto) para el observer Pi del engine, sessionDir del hijo bajo
+ * `{transcriptRoot}/{id}-{batchKey}` (default ~/.pi/agent/subagent-transcripts,
+ * override PI_SUBAGENTS_TRANSCRIPT_ROOT / deps.sessionRoot) y rm del sessionDir
+ * diferido ≥2.5s post-finish para que el engine tailee el JSONL (drain).
+ *
  * No toca el engine.
  */
 import { spawn, type ChildProcess } from "node:child_process";
@@ -361,12 +368,69 @@ function readSessionUsageFromDir(dir: string): TaskUsage | undefined {
 	return sumUsage(parts);
 }
 
-/** Ids de task van a path.join(sessionRoot, batchKey, id). Rechazar traversal. */
+/** Ids de task van a path.join(transcriptRoot, childSessionId). Rechazar traversal. */
 export const TASK_ID_RE = /^[A-Za-z0-9._-]+$/;
 export function assertSafeTaskId(id: string): void {
 	if (!TASK_ID_RE.test(id) || id === "." || id === "..") {
 		throw new Error(`subagents: id "${id}" inválido (solo [A-Za-z0-9._-]+)`);
 	}
+}
+
+// ---------- ID01-482: viz en la app (líneas machine-readable) ----------
+
+/**
+ * Root default de los sessionDir de los hijos (JSONL pi v3 que el engine
+ * tailea). Override: `PI_SUBAGENTS_TRANSCRIPT_ROOT` / `deps.sessionRoot`
+ * (deps gana). Antes vivían en `os.tmpdir()/pi-subagents` y se borraban al
+ * finish; ahora quedan ≥SESSION_DIR_RM_DELAY_MS para el drain del engine.
+ */
+export const DEFAULT_TRANSCRIPT_ROOT = path.join(os.homedir(), ".pi", "agent", "subagent-transcripts");
+
+/**
+ * Delay del rm del sessionDir post-finish: cubre el drain del observer Pi
+ * del engine (6 polls × 200ms) + margen. El rm SIEMPRE se agenda (también
+ * en fallo/timeout/kill); si falla es fail-soft.
+ */
+export const SESSION_DIR_RM_DELAY_MS = 2_500;
+
+/** transcriptRoot efectivo: deps.sessionRoot > env > default. */
+export function resolveTranscriptRoot(
+	deps: Pick<RuntimeDeps, "sessionRoot">,
+	env: NodeJS.ProcessEnv,
+): string {
+	if (deps.sessionRoot) return deps.sessionRoot;
+	const envRoot = env.PI_SUBAGENTS_TRANSCRIPT_ROOT;
+	if (envRoot !== undefined && envRoot.trim() !== "") return envRoot;
+	return DEFAULT_TRANSCRIPT_ROOT;
+}
+
+/**
+ * child_session_id del hijo (ID01-482): `{id}-{batchKey}` — único por
+ * proceso+batch; el engine no conoce batchKey y clavea por esto.
+ */
+export function childSessionIdFor(taskId: string, batchKey: string): string {
+	return `${taskId}-${batchKey}`;
+}
+
+/** Status machine del finish: mapea exitCode/skip a completed|failed|interrupted|error. */
+export type SubagentFinishStatus = "completed" | "failed" | "interrupted" | "error";
+
+export function finishStatusFor(r: Pick<SubagentResult, "exitCode" | "skipped">): SubagentFinishStatus {
+	if (r.skipped === "budget") return "interrupted"; // 125: no despachado
+	if (r.exitCode === 0) return "completed";
+	if (r.exitCode === TIMEOUT_EXIT_CODE) return "interrupted"; // 124: timeout
+	if (r.exitCode === -1) return "error"; // spawn error
+	return "failed";
+}
+
+/** `subagent_spawned: <id> role: <role> model: <model> child_session_id: <csid>` (parseable con strip_prefix, valores single-token). */
+export function formatSpawnedLine(id: string, role: Role, model: string, childSessionId: string): string {
+	return `subagent_spawned: ${id} role: ${role} model: ${model} child_session_id: ${childSessionId}`;
+}
+
+/** `subagent_finished: <id> status: completed|failed|interrupted|error` */
+export function formatFinishedLine(id: string, status: SubagentFinishStatus): string {
+	return `subagent_finished: ${id} status: ${status}`;
 }
 
 /** Tope de costo del batch: ausente / "" / NaN / <0 → undefined (sin tope). */
@@ -489,8 +553,10 @@ export interface RuntimeDeps {
 	piBin?: string;
 	cwdDefault?: string;
 	env?: NodeJS.ProcessEnv;
-	/** ID01-434: raíz de sesiones de los hijos (default os.tmpdir()/pi-subagents). */
+	/** ID01-434: raíz de sesiones de los hijos; ID01-482: override del transcriptRoot. */
 	sessionRoot?: string;
+	/** ID01-482: delay del rm del sessionDir post-finish (default 2.5s). */
+	sessionRmDelayMs?: number;
 	/** Lee usage del dir de sesión del hijo; undefined → fallback chars. */
 	readSessionUsage?: (dir: string) => TaskUsage | undefined;
 	/** Borra el dir de sesión (corre SIEMPRE: exit/timeout/kill/error). */
@@ -562,7 +628,11 @@ export function createSubagentsRuntime(deps: RuntimeDeps = {}) {
 	const killGraceMs: number = deps.killGraceMs ?? KILL_GRACE_MS;
 	const piBin: string = deps.piBin ?? defaultPiBin();
 	const baseEnv: NodeJS.ProcessEnv = deps.env ?? process.env;
-	const sessionRoot: string = deps.sessionRoot ?? path.join(os.tmpdir(), "pi-subagents");
+	// ID01-482: los sessionDir de los hijos viven bajo transcriptRoot (default
+	// ~/.pi/agent/subagent-transcripts) con nombre {id}-{batchKey} — el engine
+	// tailea el JSONL pi de ahí para la viz. deps.sessionRoot pisa TODO.
+	const transcriptRoot: string = resolveTranscriptRoot(deps, baseEnv);
+	const sessionRmDelayMs: number = deps.sessionRmDelayMs ?? SESSION_DIR_RM_DELAY_MS;
 	const readSessionUsage: (dir: string) => TaskUsage | undefined =
 		deps.readSessionUsage ?? readSessionUsageFromDir;
 	const rmSessionDir: (dir: string) => void = deps.rmSessionDir ?? ((d) => fs.rmSync(d, { recursive: true, force: true }));
@@ -570,12 +640,19 @@ export function createSubagentsRuntime(deps: RuntimeDeps = {}) {
 	// batchKey: pid + now + counter — dos procesos pi no pueden colisionar el mismo dir.
 	let batchCounter = 0;
 	const nextBatchKey = (): string => `${process.pid}-${now()}-${++batchCounter}`;
-	const cleanupBatchDir = (batchKey: string): void => {
-		try {
-			rmSessionDir(path.join(sessionRoot, batchKey));
-		} catch {
-			/* ya borrado / ENOENT */
-		}
+	// ID01-482: el rm del sessionDir se difiere ≥sessionRmDelayMs post-finish
+	// (el engine drena el JSONL 6×200ms tras subagent_finished). Fail-soft.
+	// Cada task agenda el suyo en finish() — todos los caminos (éxito, timeout,
+	// kill, error) pasan por ahí, así que no hace falta sweep por batch.
+	const scheduleSessionRm = (dir: string): void => {
+		const t = setTimeout(() => {
+			try {
+				rmSessionDir(dir);
+			} catch {
+				/* ya borrado / fail-soft */
+			}
+		}, sessionRmDelayMs);
+		t.unref?.(); // no retener el event loop por un rm diferido
 	};
 	const live = new Set<ChildProcess>();
 	const pendingKills = new Set<ReturnType<typeof setTimeout>>();
@@ -641,9 +718,10 @@ export function createSubagentsRuntime(deps: RuntimeDeps = {}) {
 		onActivity?: (activity: string) => void,
 	): Promise<SubagentResult> {
 		const startedAt = now();
-		// ID01-434 (decisión congelada): hijo CON sesión en dir descartable →
-		// usage del jsonl; stdout print-mode intacto. Se borra en finish SIEMPRE.
-		const sessionDir = path.join(sessionRoot, batchKey, task.id);
+		// ID01-434: hijo CON sesión en dir descartable → usage del jsonl;
+		// stdout print-mode intacto. ID01-482: el dir es
+		// {transcriptRoot}/{id}-{batchKey} y el rm se difiere (engine drain).
+		const sessionDir = path.join(transcriptRoot, childSessionIdFor(task.id, batchKey));
 		try {
 			mkdirSessionDir(sessionDir);
 		} catch {
@@ -733,18 +811,14 @@ export function createSubagentsRuntime(deps: RuntimeDeps = {}) {
 				}
 				const output = trimTail(parts.filter(Boolean).join("\n"));
 				// finally (exit/timeout/kill/error): usage del jsonl o fallback chars;
-				// el dir se borra SIEMPRE, también en fallo.
+				// el rm se difiere ≥2.5s (ID01-482: el engine tailea/drena el JSONL).
 				let usage: TaskUsage;
 				try {
 					usage = readSessionUsage(sessionDir) ?? { input: 0, output: 0, cacheRead: 0, chars: output.length };
 				} catch {
 					usage = { input: 0, output: 0, cacheRead: 0, chars: output.length };
 				}
-				try {
-					rmSessionDir(sessionDir);
-				} catch {
-					/* ya borrado */
-				}
+				scheduleSessionRm(sessionDir);
 				resolve({
 					id: task.id,
 					role: task.role,
@@ -1094,11 +1168,13 @@ export function createSubagentsRuntime(deps: RuntimeDeps = {}) {
 				const next = queue.shift();
 				if (!next) break;
 				// Presupuesto (ID01-434): se chequea ANTES de spawnear el próximo de la
-				// cola; los vivos terminan. Skip → result sintético exit 125.
+				// cola; los vivos terminan. Skip → result sintético exit 125 (sin
+				// spawned line: nunca se registró en inFlight → el engine no mintea chip;
+				// el finished interrupted es no-op ahí).
 				if (maxCostUsd !== undefined && accumulatedCost >= maxCostUsd) {
 					const r = budgetSkipResult(next.task, maxCostUsd, accumulatedCost);
 					results[next.index] = r;
-					emitUpdate(progressLine(r, resolved.length));
+					emitUpdate(`${progressLine(r, resolved.length)}\n${formatFinishedLine(r.id, finishStatusFor(r))}`);
 					continue;
 				}
 				inFlight.set(next.task.id, {
@@ -1107,6 +1183,16 @@ export function createSubagentsRuntime(deps: RuntimeDeps = {}) {
 					startedAt: now(),
 					lastActivityEmitAt: 0,
 				});
+				// ID01-482: línea machine-readable ANTES del await — el observer Pi
+				// del engine mintea el chip `Agent: {id} ({role})` y arranca el tail.
+				emitUpdate(
+					formatSpawnedLine(
+						next.task.id,
+						next.task.role,
+						modelKey(next.task.route),
+						childSessionIdFor(next.task.id, batchKey),
+					),
+				);
 				let r: SubagentResult;
 				try {
 					r = await runTask(next.task, batchKey, (activity) => {
@@ -1125,7 +1211,10 @@ export function createSubagentsRuntime(deps: RuntimeDeps = {}) {
 				}
 				if (typeof r.usage?.costUsd === "number") accumulatedCost += r.usage.costUsd;
 				results[next.index] = r;
-				emitUpdate(progressLine(r, resolved.length));
+				// ID01-482: progressLine (humano) + finished line (machine) en el MISMO
+				// update: el engine settlea el chip y usa el progressLine como output
+				// fallback si nunca hubo transcript.
+				emitUpdate(`${progressLine(r, resolved.length)}\n${formatFinishedLine(r.id, finishStatusFor(r))}`);
 			}
 		};
 		try {
@@ -1133,7 +1222,8 @@ export function createSubagentsRuntime(deps: RuntimeDeps = {}) {
 		} finally {
 			if (heartbeat) clearInterval(heartbeat);
 			opts?.signal?.removeEventListener("abort", onAbort);
-			cleanupBatchDir(batchKey);
+			// ID01-482: sin cleanupBatchDir — cada task ya agendó su delay-rm en
+			// finish() (todos los caminos pasan por ahí).
 		}
 		if (aborted) throw new Error("subagents: batch abortado (signal/shutdown) — hijos killed");
 		return results.map((r) => r as SubagentResult);
@@ -1328,7 +1418,8 @@ export function createSubagentsRuntime(deps: RuntimeDeps = {}) {
 						finishedAt: now(),
 					});
 				}
-				cleanupBatchDir(batchKey);
+				// ID01-482: sin cleanupBatchDir — cada task ya agendó su delay-rm en
+				// finish() (todos los caminos pasan por ahí).
 			}
 		})().catch(() => {
 			// los workers ya tragan todo; esto evita unhandledRejection si algo escapa

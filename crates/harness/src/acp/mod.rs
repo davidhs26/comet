@@ -30,6 +30,7 @@
 mod normalize;
 mod subagent;
 mod subagent_opencode;
+mod subagent_pi;
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -55,6 +56,7 @@ use crate::{Harness, HarnessError, RunControls, Signal, send_signal, shutdown_ch
 use normalize::{map_update, parse_commands, preferred_allow_option};
 use subagent::SubagentTracker;
 use subagent_opencode::OpencodeTracker;
+use subagent_pi::PiTracker;
 
 /// Per-agent configuration: which binary to spawn and what to tell the picker.
 struct AcpAgentSpec {
@@ -1464,12 +1466,14 @@ fn config_option_sets(
 }
 
 /// The per-agent subagent correlator: grok's spawn-tool + disk-tail tracker
-/// (inert for agents that never emit `subagent_*` updates), or opencode's
-/// task-chip + sidecar-bus tracker. Both observe the raw updates ahead of
-/// [`map_update`]; their tagged events flow from their own tasks.
+/// (inert for agents that never emit `subagent_*` updates), opencode's
+/// task-chip + sidecar-bus tracker, or pi's `subagents`-tool +
+/// machine-line + JSONL-tail tracker (ID01-482). All observe the raw updates
+/// ahead of [`map_update`]; their tagged events flow from their own tasks.
 enum SubagentObserver {
     Grok(SubagentTracker),
     Opencode(OpencodeTracker),
+    Pi(PiTracker),
 }
 
 impl SubagentObserver {
@@ -1477,6 +1481,7 @@ impl SubagentObserver {
         match self {
             SubagentObserver::Grok(tracker) => tracker.observe(update),
             SubagentObserver::Opencode(tracker) => tracker.observe(update),
+            SubagentObserver::Pi(tracker) => tracker.observe(update),
         }
     }
 }
@@ -2013,14 +2018,18 @@ async fn run_session(session: Session) {
     }
 
     // Subagent correlation + transcript tails: opencode rides its sidecar
-    // event bus; everything else gets the grok tracker (inert for agents
-    // that never emit the `subagent_*` extension updates).
+    // event bus; pi rides the `subagents` tool's machine-readable update
+    // lines + its own session JSONL under the transcript root (ID01-482);
+    // everything else gets the grok tracker (inert for agents that never
+    // emit the `subagent_*` extension updates).
     let mut subagents = if harness == HarnessId::Opencode {
         SubagentObserver::Opencode(OpencodeTracker::new(
             session_id.clone(),
             event_tx.clone(),
             sidecar_port.map(|p| format!("http://127.0.0.1:{p}")),
         ))
+    } else if harness == HarnessId::Pi {
+        SubagentObserver::Pi(PiTracker::new(event_tx.clone(), sessions_root))
     } else {
         SubagentObserver::Grok(SubagentTracker::new(
             session_id.clone(),
