@@ -347,15 +347,17 @@ fn pi_spec() -> AcpAgentSpec {
         executable: "pi-acp",
         env_override: "PI_ACP_EXECUTABLE",
         args: &[],
-        npm_package: Some("pi-acp@0.0.33"),
+        npm_package: Some("github:davidhs26/pi-acp#7a8548ca739f6da56ef8b90f36c683ed1fdf70e7"),
         extra_paths: npm_global_paths("pi-acp"),
         cli_executable: "pi",
         cli_extra_paths: || npm_global_bins("pi"),
         install_hint: "pi-acp (searched PATH, the login shell's PATH, npm global bins, \
-             and fnm/nvm/volta/pnpm/bun install dirs; zeron installs the pinned \
-             pi-acp automatically when npm is available — the pi CLI itself is \
-             still required, `npm install -g --ignore-scripts \
-             @earendil-works/pi-coding-agent`; set PI_ACP_EXECUTABLE to override)",
+             and fnm/nvm/volta/pnpm/bun install dirs; zeron installs our \
+             davidhs26/pi-acp fork pinned by full commit SHA (github spec, \
+             built by npm prepare — never the stale registry release) when npm \
+             is available — the pi CLI itself is still required, `npm install \
+             -g --ignore-scripts @earendil-works/pi-coding-agent`; set \
+             PI_ACP_EXECUTABLE to override)",
         // pi routes models through its own provider config (~/.pi); the picker
         // advertises the pass-through entry and pi keeps whatever the user set
         // up. Unknown ids are skipped by the config-option set.

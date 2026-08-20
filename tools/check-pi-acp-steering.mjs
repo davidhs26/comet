@@ -33,26 +33,25 @@ function resolveTarget() {
     console.error(`✗ no hay directorio de adapters: ${adaptersDir}`)
     process.exit(1)
   }
-  const versions = readdirSync(adaptersDir).filter(d => /^\d+\.\d+\.\d+$/.test(d))
-  if (versions.length === 0) {
-    console.error(`✗ sin versiones semver en ${adaptersDir}`)
+  // Install dirs are full git SHAs (fork pin, crates/harness/src/acp/mod.rs
+  // npm_package github:davidhs26/pi-acp#<sha>) or legacy npm semver.
+  const FORK_SHA = '7a8548ca739f6da56ef8b90f36c683ed1fdf70e7'
+  const SEMVER_PIN = '0.0.33'
+  const entries = readdirSync(adaptersDir).filter(
+    d => /^[0-9a-f]{40}$/.test(d) || /^\d+\.\d+\.\d+$/.test(d)
+  )
+  if (entries.length === 0) {
+    console.error(`✗ sin installs (SHA ni semver) en ${adaptersDir}`)
     process.exit(1)
   }
-  // Prefer the engine pin (crates/harness/src/acp/mod.rs npm_package pi-acp@0.0.33).
-  const PIN = '0.0.33'
-  const chosen = versions.includes(PIN)
-    ? PIN
-    : versions.sort((a, b) => {
-        const pa = a.split('.').map(Number)
-        const pb = b.split('.').map(Number)
-        return (pa[0] - pb[0]) || (pa[1] - pb[1]) || (pa[2] - pb[2])
-      }).at(-1)
-  const dist = join(adaptersDir, chosen, 'node_modules', 'pi-acp', 'dist', 'index.js')
-  if (!existsSync(dist)) {
-    console.error(`✗ dist no encontrado: ${dist}`)
+  const distFor = v => join(adaptersDir, v, 'node_modules', 'pi-acp', 'dist', 'index.js')
+  // Prefer the engine's fork SHA, then the old semver pin, then whatever exists.
+  const chosen = [FORK_SHA, SEMVER_PIN, ...entries].find(v => existsSync(distFor(v)))
+  if (!chosen) {
+    console.error(`✗ dist no encontrado: ${distFor('{' + entries.join(',') + '}')}`)
     process.exit(1)
   }
-  return dist
+  return distFor(chosen)
 }
 
 const target = resolveTarget()

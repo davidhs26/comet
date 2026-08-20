@@ -23,31 +23,57 @@ use std::time::Duration;
 
 use crate::HarnessError;
 
-/// A pinned npm package: `"@scope/name@1.2.3"` → name + version.
+/// A pinned npm package: `"@scope/name@1.2.3"` → name + version, or
+/// `"github:owner/repo#<full-sha>"` → the repo's package name (last path
+/// segment) + the SHA, so the install lands under an immutable SHA dir.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct NpmPin {
     pub name: &'static str,
     pub version: &'static str,
+    /// For `github:` pins: the full spec string, kept verbatim because npm
+    /// needs `owner/repo`, which `name` (the repo's last segment) cannot
+    /// reconstruct.
+    github_spec: Option<&'static str>,
 }
 
 impl NpmPin {
     /// Split a `name@version` pin at the LAST `@` (scoped names carry a
-    /// leading one).
+    /// leading one), or parse a `github:owner/repo#<sha>` fork pin.
     pub(crate) fn parse(pin: &'static str) -> Self {
+        if let Some(rest) = pin.strip_prefix("github:") {
+            let (repo, sha) = match rest.rsplit_once('#') {
+                Some((repo, sha)) if !sha.is_empty() => (repo, sha),
+                // Never pin a moving branch: a missing #sha is a programmer
+                // error. "missing-sha" makes the install dir scream.
+                _ => (rest, "missing-sha"),
+            };
+            return Self {
+                name: repo.rsplit('/').next().unwrap_or(repo),
+                version: sha,
+                github_spec: Some(pin),
+            };
+        }
         match pin.rfind('@') {
             Some(at) if at > 0 => Self {
                 name: &pin[..at],
                 version: &pin[at + 1..],
+                github_spec: None,
             },
             _ => Self {
                 name: pin,
                 version: "latest",
+                github_spec: None,
             },
         }
     }
 
     fn spec(&self) -> String {
-        format!("{}@{}", self.name, self.version)
+        match self.github_spec {
+            // A github pin installs by its full URL string; `name@version`
+            // would point back at the registry package.
+            Some(github) => github.to_owned(),
+            None => format!("{}@{}", self.name, self.version),
+        }
     }
 
     /// Filesystem-safe directory name (`@scope/name` → `scope__name`).
@@ -425,6 +451,27 @@ mod tests {
         assert_eq!(pin.name, "pi-acp");
         assert_eq!(pin.version, "0.0.33");
         assert_eq!(pin.dir_name(), "pi-acp");
+        assert_eq!(pin.spec(), "pi-acp@0.0.33");
+    }
+
+    #[test]
+    fn pin_parses_github_sha_spec() {
+        let pin = NpmPin::parse("github:davidhs26/pi-acp#7a8548ca739f6da56ef8b90f36c683ed1fdf70e7");
+        assert_eq!(pin.name, "pi-acp");
+        assert_eq!(pin.version, "7a8548ca739f6da56ef8b90f36c683ed1fdf70e7");
+        assert_eq!(pin.dir_name(), "pi-acp");
+        // The install spec is the whole github string, never name@version
+        // (which would resolve the stale registry package).
+        assert_eq!(
+            pin.spec(),
+            "github:davidhs26/pi-acp#7a8548ca739f6da56ef8b90f36c683ed1fdf70e7"
+        );
+    }
+
+    #[test]
+    fn github_pin_without_sha_does_not_track_head() {
+        let pin = NpmPin::parse("github:davidhs26/pi-acp");
+        assert_eq!(pin.version, "missing-sha");
     }
 
     #[test]
