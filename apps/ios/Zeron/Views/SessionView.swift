@@ -270,7 +270,7 @@ struct SessionView: View {
                             .foregroundStyle(Theme.textMuted)
                     }
                 case nil:
-                    normalStatus(chat: chat, status: status)
+                    normalStatus(chat: chat, status: status, todos: todos)
                 }
             }
             .frame(height: 24)
@@ -280,7 +280,8 @@ struct SessionView: View {
     }
 
     @ViewBuilder
-    private func normalStatus(chat: Chat, status: SessionStatus?) -> some View {
+    private func normalStatus(chat: Chat, status: SessionStatus?,
+                              todos: [TodoDisplayItem]?) -> some View {
         Group {
                 switch status {
                 case .working:
