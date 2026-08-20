@@ -122,10 +122,19 @@ struct Inner {
     /// dispatch or accepted steer) — the diff sync snapshots the checkout tree
     /// for the Changes pane's "Latest turn" scope. Absent in bare tests.
     turn_listener: OnceLock<TurnListener>,
+    /// SPEC-ID01-459 C1: set once shutdown begins (SIGTERM / StopEngine /
+    /// sign-out — before any interrupt). While set, dispatch of NEW runs is
+    /// rejected with [`DRAINING_ERROR`]; live runs keep streaming toward a
+    /// natural completion (C2) so a deploy lets the in-flight turn finish.
+    draining: std::sync::atomic::AtomicBool,
 }
 
 /// Turn-start hook: called with `(chat_id, cwd)`.
 pub type TurnListener = Arc<dyn Fn(&str, &str) + Send + Sync>;
+
+/// SPEC-ID01-459 C1.2: the observable drain rejection — RPC error frames and
+/// dispatch failures carry this text verbatim.
+pub const DRAINING_ERROR: &str = "engine is draining for a restart";
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
@@ -157,6 +166,7 @@ impl SessionsEngine {
                 harness_sessions: Mutex::new(HashMap::new()),
                 titles: OnceLock::new(),
                 turn_listener: OnceLock::new(),
+                draining: std::sync::atomic::AtomicBool::new(false),
             }),
         }
     }
@@ -221,6 +231,69 @@ impl SessionsEngine {
                 zeron_proto::SessionStatus::Working | zeron_proto::SessionStatus::AwaitingInput
             )
         })
+    }
+
+    /// SPEC-ID01-459 C2: drain deadline in seconds. `$ZERON_DRAIN_TIMEOUT_SECS`
+    /// (integer ≥ 0; `0` = legacy behavior — interrupt immediately, no wait).
+    /// Default 120.
+    pub fn drain_timeout_secs(&self) -> u64 {
+        std::env::var("ZERON_DRAIN_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(120)
+    }
+
+    /// C1: enter the draining state — from here on dispatch of new runs fails
+    /// fast with [`DRAINING_ERROR`] while live runs keep streaming. Idempotent.
+    pub fn begin_drain(&self, timeout_secs: u64) {
+        self.inner
+            .draining
+            .store(true, std::sync::atomic::Ordering::Release);
+        let live = self.live_run_count();
+        tracing::info!("draining: waiting for {live} live runs (timeout {timeout_secs}s)");
+    }
+
+    /// C1: whether the engine is draining for a restart.
+    pub fn draining(&self) -> bool {
+        self.inner
+            .draining
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Live runs right now (at most one per chat).
+    pub fn live_run_count(&self) -> usize {
+        lock(&self.inner.runs).len()
+    }
+
+    /// C1: a live steerable run for `chat_id` — the one shape still fed while
+    /// draining: a routed steer accelerates the in-flight run's completion
+    /// instead of starting a new one.
+    pub fn has_steerable_run(&self, chat_id: &str) -> bool {
+        lock(&self.inner.runs)
+            .get(chat_id)
+            .is_some_and(|h| h.steerable)
+    }
+
+    /// C2: aggregate wait for every live run to settle naturally — one poll
+    /// over the TOTAL live count, never a sequential per-chat wait. `true` =
+    /// all completed; `false` = deadline hit (the regular interrupting
+    /// shutdown takes over as the fallback).
+    pub async fn wait_for_drain(&self, timeout: std::time::Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if self.live_run_count() == 0 {
+                tracing::info!("draining: all live runs completed");
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                tracing::warn!(
+                    "draining: timeout after {}s, falling back to interrupt",
+                    timeout.as_secs()
+                );
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
     }
 
     /// The last request dispatched for a chat (steer→new-turn fallback).
@@ -293,6 +366,12 @@ impl SessionsEngine {
         mut message_id: Option<String>,
         startup_retry: bool,
     ) -> Result<String, EngineError> {
+        // SPEC-ID01-459 C1.2 drain gate (fail fast): a draining engine takes
+        // no NEW runs. A live steerable run may still be fed — the routed path
+        // below turns this dispatch into a steer of the in-flight turn.
+        if self.draining() && !self.has_steerable_run(chat_id) {
+            return Err(EngineError::Other(DRAINING_ERROR.into()));
+        }
         // Project-less chats store cwd `~` (the creating device can't know the
         // host's home); expand it here, on the host, where the run spawns.
         request.cwd = expand_home(&request.cwd);
@@ -359,6 +438,13 @@ impl SessionsEngine {
             self.interrupt(chat_id).await?;
         }
 
+        // SPEC-ID01-459 C1.2 drain gate (dispatch seam): covers the race where
+        // the routed run died between the fail-fast gate above and here — a
+        // fresh run must not start once draining began (this is the point of
+        // dispatch, not just the RPC layer).
+        if self.draining() {
+            return Err(EngineError::Other(DRAINING_ERROR.into()));
+        }
         let harness = self.inner.registry.resolve(harness_id)?;
         let handle = self.doc_handle(chat_id)?;
         let user_id = message_id.unwrap_or_else(new_id);
