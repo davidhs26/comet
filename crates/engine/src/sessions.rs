@@ -121,6 +121,36 @@ struct RunHandle {
     /// and re-dispatches each entry as a fresh turn, so an accepted message
     /// can never silently evaporate from a transcript that shows it as sent.
     routed_steers: Arc<Mutex<std::collections::VecDeque<RoutedSteer>>>,
+    /// SPEC-ID01-519 bug 2: dispatch-side liveness probe, kept fresh by the
+    /// run task. Read by `dispatch_inner`/`steer`'s zombie gate — see
+    /// [`RunProbe`].
+    probe: RunProbe,
+}
+
+/// SPEC-ID01-519 bug 2: dispatch-side liveness probe of a live run, kept
+/// fresh by the run task. `stream_idle` holds the LAST stream event's time
+/// (`None` until the first event — a cold run still booting has streamed
+/// nothing and is never a zombie); `in_flight` mirrors the quiesce
+/// watchdog's fold gate (see [`fold_inflight`]) so both silence paths —
+/// watchdog park and zombie abort — decide on the SAME definition of "work
+/// in flight".
+#[derive(Clone, Default)]
+struct RunProbe {
+    stream_idle: Arc<Mutex<Option<std::time::Instant>>>,
+    in_flight: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl RunProbe {
+    /// SPEC-ID01-519 bug 2: true when the run already streamed, has been
+    /// silent past `window`, and its fold shows nothing in flight. A prompt
+    /// routed there would sit in the mailbox until a turn boundary that
+    /// never comes (missing harness Done; the 2026-08-18 incident measured
+    /// a 435s TTFT for a nudged prompt) — the caller interrupts the zombie
+    /// and dispatches fresh instead.
+    fn silent_beyond(&self, window: std::time::Duration) -> bool {
+        !self.in_flight.load(std::sync::atomic::Ordering::Relaxed)
+            && lock(&self.stream_idle).is_some_and(|at| at.elapsed() >= window)
+    }
 }
 
 /// One accepted-but-unconfirmed steer: enough to re-dispatch it verbatim.
@@ -420,55 +450,82 @@ impl SessionsEngine {
                 h.runtime_config.can_route(harness_id, &request),
                 h.steer_tx.clone(),
                 h.routed_steers.clone(),
+                h.probe.clone(),
             )
         });
-        if let Some((run_id, steerable, same_runtime, steer_tx, ledger)) = routed {
-            let message = SteerMessage {
-                prompt: request.prompt.clone(),
-                message_id: message_id.clone(),
-            };
-            if steerable && same_runtime && steer_tx.try_send(message).is_ok() {
-                // The run can vanish between the send and here (the idle
-                // reaper, a parked child death): the ledger entry below is
-                // the at-least-once guarantee — the run task's exit drain
-                // re-dispatches any accepted steer no `Steered` confirmed.
-                let user_id = message_id.clone().unwrap_or_else(new_id);
-                lock(&ledger).push_back(RoutedSteer {
-                    prompt: request.prompt.clone(),
-                    message_id: user_id.clone(),
+        if let Some((run_id, steerable, same_runtime, steer_tx, ledger, probe)) = routed {
+            // SPEC-ID01-519 bug 2 (zombie turn): a WORKING run whose stream
+            // has been silent past ZERON_ZOMBIE_PROMPT_MS with NOTHING in
+            // flight is a turn whose harness Done went missing — steering it
+            // would hold this prompt in the mailbox until the quiesce
+            // watchdog parks (up to 300s in prod; the 2026-08-18 incident
+            // measured a 435s TTFT). Interrupt the zombie and dispatch fresh
+            // below instead. The in-flight gate is the watchdog's own: an
+            // open tool legitimately silent for minutes still steers, never
+            // aborts. A PARKED run (Done-parked, child warm) also steers —
+            // only the Working-but-mute shape trips this. Knob at 0 keeps
+            // the pre-fix always-steer routing.
+            let zombie = steerable
+                && same_runtime
+                && zombie_prompt_after().is_some_and(|window| {
+                    self.session_status(chat_id)
+                        .is_some_and(|s| s.status == SessionStatus::Working)
+                        && probe.silent_beyond(window)
                 });
-                let handle = self.doc_handle(chat_id)?;
-                handle.write_user_message(&user_id, &request.prompt, now_ms())?;
-                if self.is_live(chat_id, &run_id) {
-                    // Working BEFORE the lastMessageAt bump: both ride the
-                    // workspace doc from this one peer, so causal order makes it
-                    // impossible for an observer to hold [new message, old status]
-                    // — that gap read as unseen-with-no-live-run = a phantom
-                    // "completed" flash on every remote send (2026-07-31).
-                    // User prompt: restamp the task timer here, not later
-                    // at the Steered event. A parked session keeps its old
-                    // started_at; fresh_start:false would reopen that clock
-                    // (the "timer opens at 30:00 on send" bug).
-                    self.set_status(chat_id, SessionStatus::Working, true);
-                    self.inner.note_message(chat_id, &request.prompt);
-                    return Ok(run_id);
-                }
-                // The run died around the send. If its exit drain already
-                // claimed the entry, that re-dispatch owns the message —
-                // otherwise reclaim it and fall through to a fresh run.
-                let reclaimed = {
-                    let mut ledger = lock(&ledger);
-                    let before = ledger.len();
-                    ledger.retain(|s| s.message_id != user_id);
-                    ledger.len() != before
+            if !zombie {
+                let message = SteerMessage {
+                    prompt: request.prompt.clone(),
+                    message_id: message_id.clone(),
                 };
-                if !reclaimed {
-                    self.inner.note_message(chat_id, &request.prompt);
-                    return Ok(run_id);
+                if steerable && same_runtime && steer_tx.try_send(message).is_ok() {
+                    // The run can vanish between the send and here (the idle
+                    // reaper, a parked child death): the ledger entry below is
+                    // the at-least-once guarantee — the run task's exit drain
+                    // re-dispatches any accepted steer no `Steered` confirmed.
+                    let user_id = message_id.clone().unwrap_or_else(new_id);
+                    lock(&ledger).push_back(RoutedSteer {
+                        prompt: request.prompt.clone(),
+                        message_id: user_id.clone(),
+                    });
+                    let handle = self.doc_handle(chat_id)?;
+                    handle.write_user_message(&user_id, &request.prompt, now_ms())?;
+                    if self.is_live(chat_id, &run_id) {
+                        // Working BEFORE the lastMessageAt bump: both ride the
+                        // workspace doc from this one peer, so causal order makes it
+                        // impossible for an observer to hold [new message, old status]
+                        // — that gap read as unseen-with-no-live-run = a phantom
+                        // "completed" flash on every remote send (2026-07-31).
+                        // User prompt: restamp the task timer here, not later
+                        // at the Steered event. A parked session keeps its old
+                        // started_at; fresh_start:false would reopen that clock
+                        // (the "timer opens at 30:00 on send" bug).
+                        self.set_status(chat_id, SessionStatus::Working, true);
+                        self.inner.note_message(chat_id, &request.prompt);
+                        return Ok(run_id);
+                    }
+                    // The run died around the send. If its exit drain already
+                    // claimed the entry, that re-dispatch owns the message —
+                    // otherwise reclaim it and fall through to a fresh run.
+                    let reclaimed = {
+                        let mut ledger = lock(&ledger);
+                        let before = ledger.len();
+                        ledger.retain(|s| s.message_id != user_id);
+                        ledger.len() != before
+                    };
+                    if !reclaimed {
+                        self.inner.note_message(chat_id, &request.prompt);
+                        return Ok(run_id);
+                    }
+                    // Keep the already-written doc entry's id for the fresh run
+                    // below (write_user_message dedupes by id).
+                    message_id = Some(user_id);
                 }
-                // Keep the already-written doc entry's id for the fresh run
-                // below (write_user_message dedupes by id).
-                message_id = Some(user_id);
+            } else {
+                tracing::warn!(
+                    chat = %chat_id,
+                    "zombie turn: Working run silent past the zombie window with \
+                     nothing in flight; interrupting for a fresh dispatch"
+                );
             }
             if !same_runtime {
                 tracing::debug!(
@@ -476,9 +533,10 @@ impl SessionsEngine {
                     "restarting live harness to apply changed run configuration"
                 );
             }
-            // Mailbox closed (runtime mid-teardown / non-steering harness) or
-            // the routed run died with the message reclaimed, or configuration
-            // changed beyond what the text-only mailbox can carry: replace it.
+            // Mailbox closed (runtime mid-teardown / non-steering harness),
+            // the routed run died with the message reclaimed, configuration
+            // changed beyond what the text-only mailbox can carry — or the
+            // zombie gate above chose to replace a silent Working run.
             self.interrupt(chat_id).await?;
         }
 
@@ -536,6 +594,10 @@ impl SessionsEngine {
             steering: steer_rx,
             interrupt: interrupt_token.clone(),
         };
+        // SPEC-ID01-519 bug 2: the dispatch-side liveness probe — the run
+        // task publishes stream activity and the fold's in-flight state
+        // into it; the zombie gate above reads it.
+        let probe = RunProbe::default();
 
         lock(&self.inner.runs).insert(
             chat_id.to_string(),
@@ -549,6 +611,7 @@ impl SessionsEngine {
                 engine_tx,
                 pending_inputs,
                 routed_steers: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+                probe: probe.clone(),
             },
         );
         self.set_status(chat_id, SessionStatus::Working, true);
@@ -580,6 +643,7 @@ impl SessionsEngine {
                 resume_injected,
                 startup_retry,
             },
+            probe,
         ));
         Ok(run_id)
     }
@@ -600,11 +664,30 @@ impl SessionsEngine {
                     h.run_id.clone(),
                     h.steer_tx.clone(),
                     h.routed_steers.clone(),
+                    h.probe.clone(),
                 )
             });
-        let Some((run_id, steer_tx, ledger)) = target else {
+        let Some((run_id, steer_tx, ledger, probe)) = target else {
             return Ok(SteerOutcome::NotSteerable);
         };
+        // SPEC-ID01-519 bug 2: the dispatch path's zombie gate, mirrored
+        // here — steering a silent Working run with nothing in flight would
+        // queue this prompt until the quiesce watchdog parks (up to 300s in
+        // prod). NotSteerable hands it to the caller's fresh dispatch
+        // instead (the documented executor fallback). Same rules as
+        // dispatch: an open tool still steers; a parked run still steers;
+        // knob 0 keeps the pre-fix behavior.
+        if zombie_prompt_after().is_some_and(|window| {
+            self.session_status(chat_id)
+                .is_some_and(|s| s.status == SessionStatus::Working)
+                && probe.silent_beyond(window)
+        }) {
+            tracing::warn!(
+                chat = %chat_id,
+                "zombie turn: declining steer on a silent run; caller dispatches fresh"
+            );
+            return Ok(SteerOutcome::NotSteerable);
+        }
         let message = SteerMessage {
             prompt: prompt.to_string(),
             message_id: message_id.clone(),
@@ -1366,6 +1449,48 @@ struct RunResumeState {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// SPEC-ID01-519 bug 2: the quiesce watchdog's in-flight gate — the zombie
+/// abort reuses it VERBATIM so both silence paths decide on the same
+/// definition of "work in flight". An unresolved tool part is a command
+/// still running (legitimately silent for minutes), an unresolved input
+/// part is a question awaiting the user; the live-plan chip singleton never
+/// resolves and is exempt. Both the watchdog's park and dispatch's zombie
+/// abort must refuse to act while this says true.
+fn fold_inflight(folded: &[MessagePart]) -> bool {
+    folded.iter().any(|p| match p {
+        MessagePart::Tool {
+            id,
+            resolved: false,
+            ..
+        } => id != zeron_proto::LIVE_PLAN_TOOL_ID,
+        MessagePart::Input {
+            resolved: false, ..
+        } => true,
+        _ => false,
+    })
+}
+
+/// SPEC-ID01-519 bug 2: how long a WORKING run with nothing in flight may
+/// stay stream-silent before a dispatched prompt refuses to route as a
+/// steer and replaces the run instead. Rationale: accepted TTFT is <60s;
+/// 8s clears a healthy ACP child's turn-boundary latency by orders of
+/// magnitude while staying far below the quiesce park (300s in prod).
+/// `ZERON_ZOMBIE_PROMPT_MS` overrides (parsed like the quiesce knobs);
+/// `0` disables the abort — prompts keep queueing as steers, the pre-fix
+/// behavior.
+const ZOMBIE_PROMPT_WINDOW_MS: u64 = 8_000;
+
+fn zombie_prompt_after() -> Option<std::time::Duration> {
+    match std::env::var("ZERON_ZOMBIE_PROMPT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        Some(0) => None,
+        Some(ms) => Some(std::time::Duration::from_millis(ms)),
+        None => Some(std::time::Duration::from_millis(ZOMBIE_PROMPT_WINDOW_MS)),
+    }
+}
+
 async fn drive_run(
     inner: Arc<Inner>,
     chat_id: String,
@@ -1377,6 +1502,7 @@ async fn drive_run(
     mut engine_rx: mpsc::UnboundedReceiver<AgentEvent>,
     mut cancel_rx: watch::Receiver<bool>,
     resume_state: RunResumeState,
+    probe: RunProbe,
 ) {
     let device_id = inner.device_id.clone();
     // Captured for post-run auto-titling (the request moves into the harness).
@@ -1505,6 +1631,36 @@ async fn drive_run(
             None => Some(std::time::Duration::from_secs(20)),
         };
     let mut self_continued_turn = false;
+    // SPEC-ID01-519 bug 3: WHY the last park happened decides the window
+    // the NEXT resume arms. A Done-park, or the quiesce of a turn that was
+    // already self-continued, means any post-park output is NEW self-started
+    // work → the short window (2026-08-13: 2min of phantom Working after
+    // background wakes). But a quiesce park of a USER turn — the harness
+    // Done went missing mid-turn — is that SAME turn pausing: its resume
+    // must keep the long window (2026-08-18: the resume blanket-set
+    // self_continued_turn, shrank a 300s window to 20s, and the turn
+    // re-parked ~24s after resuming, flapping Working/Idle).
+    let mut resume_arms_short_window = false;
+    // Effective quiesce window for the current turn kind (a self-continued
+    // turn caps the normal window with the short one). Shared by the sleep
+    // below AND the park WARN so the log reports the window that ACTUALLY
+    // fired — it used to print the knob value while self-continued parks
+    // fired at ~20s (SPEC-ID01-519 bug 3).
+    let quiesce_window = |self_continued: bool| {
+        let mut window = quiesce_after.unwrap_or_default();
+        if self_continued && let Some(short) = self_quiesce_after {
+            window = window.min(short);
+        }
+        window
+    };
+    // SPEC-ID01-519 bug 2: mirror the fold's in-flight state into the run
+    // handle's probe after every fold mutation — dispatch's zombie gate
+    // reads it (same `fold_inflight` as the watchdog's guard below).
+    let sync_probe = |folded: &[MessagePart]| {
+        probe
+            .in_flight
+            .store(fold_inflight(folded), std::sync::atomic::Ordering::Relaxed);
+    };
     // Spawn chips that have SETTLED (tagged Done seen). Content events for a
     // settled chip with no live sink are dropped — a straggler frame after
     // the freeze must not mint a new doc entry or wedge the transcript back
@@ -1614,27 +1770,17 @@ async fn drive_run(
             // fold still arms — a Steered boundary that no output ever
             // follows is one of the wedge shapes — it just parks without
             // writing a segment (an empty finalize would leave a stub entry).
-            _ = tokio::time::sleep_until({
-                let mut window = quiesce_after.unwrap_or_default();
-                if self_continued_turn && let Some(short) = self_quiesce_after {
-                    window = window.min(short);
-                }
-                last_stream_activity + window
-            }), if quiesce_after.is_some()
+            _ = tokio::time::sleep_until(
+                last_stream_activity + quiesce_window(self_continued_turn),
+            ), if quiesce_after.is_some()
                 && idle_since.is_none()
                 && !interrupted
                 && steerable
-                && !folded.iter().any(|p| match p {
-                    MessagePart::Tool { id, resolved: false, .. } => {
-                        id != zeron_proto::LIVE_PLAN_TOOL_ID
-                    }
-                    MessagePart::Input { resolved: false, .. } => true,
-                    _ => false,
-                }) =>
+                && !fold_inflight(&folded) =>
             {
                 tracing::warn!(
                     chat = %chat_id,
-                    quiet_ms = quiesce_after.unwrap_or_default().as_millis() as u64,
+                    quiet_ms = quiesce_window(self_continued_turn).as_millis() as u64,
                     "turn quiesced: stream silent after completed output with no \
                      turn-end; parking (suspected missing harness Done)"
                 );
@@ -1656,8 +1802,13 @@ async fn drive_run(
                 dirty = false;
                 entry_id = new_id();
                 segment_started = now_ms();
+                // SPEC-ID01-519 bug 3: record WHY we park, BEFORE resetting
+                // the turn kind — a quiesce of a USER turn must not arm the
+                // short window on its own resume.
+                resume_arms_short_window = self_continued_turn;
                 idle_since = Some(tokio::time::Instant::now());
                 self_continued_turn = false;
+                sync_probe(&folded);
                 inner.set_status(&chat_id, SessionStatus::Idle, false);
                 continue;
             }
@@ -1706,6 +1857,7 @@ async fn drive_run(
                     }
                 }
                 zeron_doc::fold_event_into_parts(&mut folded, &event);
+                sync_probe(&folded);
                 if !dirty {
                     dirty = true;
                     flush_at = tokio::time::Instant::now()
@@ -1813,6 +1965,11 @@ async fn drive_run(
         // push the quiesce watchdog's window out.
         inner.touch_session(&chat_id);
         last_stream_activity = tokio::time::Instant::now();
+        // SPEC-ID01-519 bug 2: same signal, published to the handle's probe
+        // (std clock — dispatch only ever reads elapsed()). `None` until the
+        // first event: a cold run still booting has streamed nothing and is
+        // never a zombie.
+        *lock(&probe.stream_idle) = Some(std::time::Instant::now());
         // The engine's input bridge is the sole authority on input requests:
         // it mints the id and parks the resolver BEFORE emitting the event,
         // so a legitimate id is always pending here. A harness emitting its
@@ -1878,7 +2035,14 @@ async fn drive_run(
                     "parked session resumed by self-continued agent output"
                 );
                 idle_since = None;
-                self_continued_turn = true;
+                // SPEC-ID01-519 bug 3: the resumed turn inherits the PARK'S
+                // cause, not a blanket self-continued verdict. A Done-park
+                // (or the quiesce of an already-self-continued turn) resumes
+                // as new self-started work — short window. A quiesce-parked
+                // USER turn (missing harness Done) is the SAME user turn
+                // continuing: it keeps the long window instead of re-parking
+                // ~20s after the resume.
+                self_continued_turn = resume_arms_short_window;
                 // The park cleared the fold; rotate to a fresh entry and
                 // fall through — this event is the new segment's first part.
                 // No fresh_start: this is the SAME user task continuing, so
@@ -2032,6 +2196,7 @@ async fn drive_run(
             }
             inner.note_message(&chat_id, &folded_text(&folded));
             folded.clear();
+            sync_probe(&folded);
             dirty = false;
             entry_id = next_assistant_message_id.clone().unwrap_or_else(new_id);
             segment_started = now_ms();
@@ -2082,6 +2247,7 @@ async fn drive_run(
         let skip_fold = matches!(&event, AgentEvent::SessionStarted { .. }) && !folded.is_empty();
         if !skip_fold {
             fold_event_into_parts(&mut folded, &event);
+            sync_probe(&folded);
             // R2 sidecar PARKED (2026-08-10, product call): the fold's
             // summary/stats ARE the doc's whole record — no refs stamped, no
             // uploads. Full outputs survive only in the host's local run
@@ -2159,8 +2325,12 @@ async fn drive_run(
                 segment_started = now_ms();
                 // Resume-retry is strictly a first-turn concern.
                 saw_session_started = true;
+                // SPEC-ID01-519 bug 3: the turn ENDED cleanly — any output
+                // after this park is new self-started work: short window.
+                resume_arms_short_window = true;
                 idle_since = Some(tokio::time::Instant::now());
                 self_continued_turn = false;
+                sync_probe(&folded);
                 inner.set_status(&chat_id, SessionStatus::Idle, false);
                 continue;
             }
