@@ -431,14 +431,16 @@ pub fn default_registry() -> HarnessRegistry {
         Box::new(|| Ok(Arc::new(zeron_harness::AcpHarness::hermes()) as Arc<dyn Harness>)),
     );
     // pi over ACP (community `pi-acp` adapter), same lazy pattern: the static
-    // descriptor mirrors AcpHarness::pi() exactly — turn-boundary steering,
+    // descriptor mirrors AcpHarness::pi() exactly — step-boundary steering
+    // (the adapter implements `_session/steering` bridging pi's native RPC
+    // steer; detection stays dynamic at initialize),
     // pi's thinking ladder minus its "off" tier.
     registry.register_lazy(
         HarnessDescriptor {
             id: HarnessId::Pi,
             name: "Pi".into(),
             supports_steering: true,
-            steering_mode: SteeringMode::TurnBoundary,
+            steering_mode: SteeringMode::StepBoundary,
             reasoning_levels: vec![
                 ReasoningLevel::Minimal,
                 ReasoningLevel::Low,
@@ -585,7 +587,7 @@ mod tests {
         let pi = registry.resolve(HarnessId::Pi).unwrap();
         assert_eq!(pi.id(), HarnessId::Pi);
         assert_eq!(pi.display_name(), "Pi");
-        assert_eq!(pi.steering_mode(), SteeringMode::TurnBoundary);
+        assert_eq!(pi.steering_mode(), SteeringMode::StepBoundary);
         assert_eq!(
             pi.reasoning_levels(),
             &[
