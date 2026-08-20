@@ -167,15 +167,14 @@ struct SessionView: View {
                     // The strip reserves its 24pt whether or not a run is
                     // live, so the composer never shifts. It sits on the
                     // solid floor right where the transcript's fade completes.
-                    // Hit testing stays off (today's behavior) unless the
-                    // to-do chip is actually visible (ID01-503): while working
-                    // any non-empty list shows it; settled, only pending
-                    // items keep it — mirroring statusStrip's own rule.
+                    // Hit-testing stays off salvo el retry affordance (upstream)
+                    // o el chip de to-dos visible (ID01-503): working muestra
+                    // cualquier lista no vacía; settled, solo pendientes.
                     let todos = store.latestTodoItems
                     let chipVisible = !(todos?.isEmpty ?? true)
                         && (status == .working || todos?.contains(where: { !$0.done }) == true)
-                    statusStrip(chat: chat, status: status, todos: todos)
-                        .allowsHitTesting(chipVisible)
+                    statusStrip(chat: chat, status: status, store: store, todos: todos)
+                        .allowsHitTesting(model.sendState(for: chat) == .failed || chipVisible)
                     Group {
                         if let request = store.openInputRequest {
                             QuestionPanel(requestId: request.requestId, questions: request.questions) { requestId, answers in
@@ -232,14 +231,58 @@ struct SessionView: View {
     /// Reserved 24pt status strip (shell.rs render_status_strip) — Working
     /// shows the sunrise spinner + rotating flavour word + elapsed; Errored
     /// shows "Run failed"; the strip always reserves its height so the
-    /// composer never shifts. The to-do chip (ID01-503) rides first: while
-    /// working it joins the spinner line (`⏳ 2/5 · flavour · 4:12`), and
-    /// once the turn settles it persists on its own (`⏳ d/n`) while any
-    /// item is still pending — an empty or all-done list retires it.
-    private func statusStrip(chat: Chat, status: SessionStatus?,
+    /// composer never shifts. An unadopted send's truth takes precedence
+    /// ("Sending…" / "Queued" / "Not delivered — tap to retry"); the to-do
+    /// chip (ID01-503) rides the spinner line while working (`⏳ 2/5 · …`)
+    /// and persists solo tras el settle mientras haya pendientes.
+    private func statusStrip(chat: Chat, status: SessionStatus?, store: SessionStore,
                              todos: [TodoDisplayItem]?) -> some View {
         TimelineView(.periodic(from: .now, by: 1)) { _ in
             HStack(spacing: 6) {
+                switch model.sendState(for: chat) {
+                case .failed?:
+                    Button {
+                        store.retryDelivery()
+                    } label: {
+                        Text("Not delivered — tap to retry")
+                            .font(Theme.sans(11))
+                            .foregroundStyle(Theme.danger)
+                    }
+                    .buttonStyle(.plain)
+                case .queued?:
+                    Circle()
+                        .fill(Theme.warning)
+                        .frame(width: 5, height: 5)
+                    Text("Queued — will send automatically")
+                        .font(Theme.sans(11))
+                        .foregroundStyle(Theme.warning.opacity(0.9))
+                case .sending?:
+                    // The percent tracks the REAL relay transfer (escort
+                    // bytes committed to the host), not just local staging.
+                    if let progress = store.transferProgress {
+                        Text("Uploading… \(Int(progress * 100))%")
+                            .font(Theme.sans(11))
+                            .foregroundStyle(Theme.textMuted)
+                            .monospacedDigit()
+                    } else {
+                        Text("Sending…")
+                            .font(Theme.sans(11))
+                            .foregroundStyle(Theme.textMuted)
+                    }
+                case nil:
+                    normalStatus(chat: chat, status: status, todos: todos)
+                }
+            }
+            .frame(height: 24)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.leading, 26)  // aligns with the composer's text start
+        }
+    }
+
+    @ViewBuilder
+    private func normalStatus(chat: Chat, status: SessionStatus?,
+                              todos: [TodoDisplayItem]?) -> some View {
+        Group {
                 switch status {
                 case .working:
                     if let todos, !todos.isEmpty {
@@ -274,10 +317,6 @@ struct SessionView: View {
                         EmptyView()
                     }
                 }
-            }
-            .frame(height: 24)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.leading, 26)  // aligns with the composer's text start
         }
     }
 

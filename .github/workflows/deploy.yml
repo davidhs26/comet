@@ -8,9 +8,10 @@ name: deploy
 # The token needs: Workers Scripts (edit), Workers Routes (edit) on zeron.sh,
 # Workers R2 Storage (edit). Account id is pinned in edge/wrangler.jsonc.
 
+# CI hosted apagado 2026-08-20 (facturaba en runners de GitHub; el gate
+# real es local: cargo tests + suites + golden + review adversarial).
 on:
   workflow_dispatch:
-
 concurrency:
   group: deploy-main
   cancel-in-progress: false
