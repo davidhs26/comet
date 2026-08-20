@@ -43,6 +43,8 @@ fn request(prompt: &str) -> RunRequest {
         attachments: Vec::new(),
         worktree: None,
         resume: None,
+
+        utility: false,
     }
 }
 
@@ -638,7 +640,7 @@ fn hermes_and_pi_descriptor_surfaces_match_registry_expectations() {
     assert_eq!(pi.id(), HarnessId::Pi);
     assert_eq!(pi.display_name(), "Pi");
     assert!(pi.supports_steering());
-    assert_eq!(pi.steering_mode(), SteeringMode::TurnBoundary);
+    assert_eq!(pi.steering_mode(), SteeringMode::StepBoundary);
     assert_eq!(
         pi.reasoning_levels(),
         &[

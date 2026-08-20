@@ -128,11 +128,20 @@ final class DemoDataset {
 
     private static let repoNames: Set<String> = ["zeron", "dotfiles", "blog", "playground", "edge", "landing"]
 
-    func listFolders(deviceId: String, path: String) -> FolderListing {
-        let entries = (Self.fileTree[path] ?? []).map { name in
-            FolderEntry(name: name, isDir: true, isRepo: Self.repoNames.contains(name))
+    func listFolders(deviceId: String, path: String) -> FolderListing? {
+        if let names = Self.fileTree[path] {
+            let entries = names.map { name in
+                FolderEntry(name: name, isDir: true, isRepo: Self.repoNames.contains(name))
+            }
+            return FolderListing(path: path, entries: entries, truncated: false)
         }
-        return FolderListing(path: path, entries: entries, truncated: false)
+        // Leaf folder listed by its parent but with no further children.
+        let parent = (path as NSString).deletingLastPathComponent
+        let name = (path as NSString).lastPathComponent
+        if let kids = Self.fileTree[parent], kids.contains(name) {
+            return FolderListing(path: path, entries: [], truncated: false)
+        }
+        return nil
     }
 
     private var refsByPath: [String: [RepoRef]] = [:]

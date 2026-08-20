@@ -1146,6 +1146,10 @@ impl RpcService for EngineRpc {
                     .models()
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
+                // Fork: trim the picker to the owner's curated set via
+                // ~/.zeron/model-allowlist.json (see model_allowlist.rs).
+                // Absent/corrupt/empty/non-matching config passes through.
+                let models = crate::model_allowlist::apply_for(p.harness, models);
                 RpcReply::value(&models)
             }
             methods::LIST_COMMANDS => {
@@ -1168,6 +1172,30 @@ impl RpcService for EngineRpc {
             }
             methods::QUEUE_COMMAND => {
                 let p: QueueCommandParams = parse_params(params)?;
+                // SPEC-ID01-459 C1.2 (review fix): while draining, only a
+                // command that would dispatch a NEW run fails fast with the
+                // drain error (the standard method-error frame — same
+                // observable shape as any other method failure):
+                // - Run: always a new turn → reject.
+                // - Steer: reject only when no live steerable run can absorb
+                //   it — its fallback (dead-run dispatch) would start a run.
+                // - Interrupt / RespondInput: accelerate or destraban the
+                //   in-flight turn → pass.
+                // The dispatch seam re-checks, so commands already in flight
+                // cannot start a run after the flag either.
+                if self.sessions.draining() {
+                    let rejects_new_run = match &p.command {
+                        SessionCommandPayload::Run { .. } => true,
+                        SessionCommandPayload::Steer { .. } => {
+                            !self.sessions.has_steerable_run(&p.chat_id)
+                        }
+                        SessionCommandPayload::Interrupt {}
+                        | SessionCommandPayload::RespondInput { .. } => false,
+                    };
+                    if rejects_new_run {
+                        return Err(RpcError::Failed(crate::DRAINING_ERROR.into()));
+                    }
+                }
                 let command_id = self
                     .doc_host
                     .queue_command_with_transfers(&p.chat_id, p.command, p.transfers)

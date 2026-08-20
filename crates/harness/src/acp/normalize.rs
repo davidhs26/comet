@@ -357,6 +357,7 @@ pub(crate) fn map_update(update: &Value) -> Vec<AgentEvent> {
             if let Some(resolved) = resolved_result(update, id) {
                 events.push(resolved);
             }
+            events.extend(todos_chip_events(update));
             events
         }
         "tool_call_update" => {
@@ -379,6 +380,7 @@ pub(crate) fn map_update(update: &Value) -> Vec<AgentEvent> {
             if let Some(resolved) = resolved_result(update, id) {
                 events.push(resolved);
             }
+            events.extend(todos_chip_events(update));
             events
         }
         "plan" => {
@@ -420,6 +422,89 @@ pub(crate) fn map_update(update: &Value) -> Vec<AgentEvent> {
         }
         _ => Vec::new(),
     }
+}
+
+/// The pi todos extension's `set_todos`/`update_todo` tools feed the same
+/// stable chip the ACP `plan` update drives: emit a synthetic ToolCall under
+/// [`LIVE_PLAN_TOOL_ID`] (+ a non-error result) so every refresh folds into
+/// the one chip. Full-list sources only — the batch `rawInput.items` of
+/// `set_todos`, or the post-application echo the extension stamps on
+/// `rawOutput.details.todos` (`update_todo`'s rawInput is a patch, never a
+/// list). An empty list still emits: it is how a cleared todo list retires
+/// the chip. The ORIGINAL tool call is left untouched (its real id keeps
+/// its own fold); only the synthetic pair rides along.
+fn todos_chip_events(update: &Value) -> Vec<AgentEvent> {
+    let echo = update
+        .get("rawOutput")
+        .and_then(|o| o.get("details"))
+        .and_then(|d| d.get("todos"))
+        .and_then(Value::as_array);
+    let is_todos_tool = {
+        let matches_name = |n: &str| matches!(n, "set_todos" | "update_todo");
+        matches_name(&str_field(update, "title"))
+            || xai_tool_name(update).is_some_and(matches_name)
+    };
+    // Failed call: retire any optimistic chip (empty list) instead of
+    // leaving items that were never applied (hallazgo k3).
+    if is_todos_tool && update.get("status").and_then(Value::as_str) == Some("failed") {
+        return synthetic_todo_chip(Vec::new());
+    }
+    if !is_todos_tool && echo.is_none() {
+        return Vec::new();
+    }
+    // Prefer the post-application echo (validated). rawInput.items only for
+    // the todos tools themselves — a foreign tool with details.todos must
+    // not inherit its own rawInput.items (hallazgo k3).
+    let input_items = is_todos_tool
+        .then(|| {
+            update
+                .get("rawInput")
+                .and_then(|r| r.get("items"))
+                .and_then(Value::as_array)
+        })
+        .flatten();
+    let Some(source) = echo.or(input_items) else {
+        return Vec::new();
+    };
+    let items: Vec<TodoItem> = source.iter().filter_map(todo_item_from).collect();
+    synthetic_todo_chip(items)
+}
+
+fn synthetic_todo_chip(items: Vec<TodoItem>) -> Vec<AgentEvent> {
+    vec![
+        AgentEvent::ToolCall {
+            id: zeron_proto::LIVE_PLAN_TOOL_ID.into(),
+            call: ToolCall::Todo { items },
+        },
+        AgentEvent::ToolResult {
+            id: zeron_proto::LIVE_PLAN_TOOL_ID.into(),
+            is_error: false,
+            output: None,
+            diff: None,
+        },
+    ]
+}
+
+/// One extension todo entry (`{id, text, status, note?}`) → the wire's
+/// compressed `TodoItem`: `done|cancelled` counts as done, an in-progress
+/// note is folded into the text, everything else reads as pending.
+fn todo_item_from(v: &Value) -> Option<TodoItem> {
+    let text = str_field(v, "text");
+    if text.is_empty() {
+        return None;
+    }
+    let status = str_field(v, "status");
+    let text = if status == "in_progress" {
+        let note = str_field(v, "note");
+        (!note.is_empty()).then(|| format!("{text} — {note}"))
+    } else {
+        None
+    }
+    .unwrap_or(text);
+    Some(TodoItem {
+        text,
+        done: matches!(status.as_str(), "done" | "cancelled"),
+    })
 }
 
 /// A terminal `status` on a tool_call/tool_call_update resolves the call:
@@ -631,6 +716,7 @@ mod tests {
             ],
         });
         let events = map_update(&update);
+        assert_eq!(events.len(), 2);
         assert_eq!(
             events[0],
             AgentEvent::ToolCall {
@@ -649,6 +735,195 @@ mod tests {
                 },
             }
         );
+        // The non-error result closes the synthetic call so the chip never
+        // reads as a hanging tool.
+        assert_eq!(
+            events[1],
+            AgentEvent::ToolResult {
+                id: zeron_proto::LIVE_PLAN_TOOL_ID.into(),
+                is_error: false,
+                output: None,
+                diff: None,
+            }
+        );
+    }
+
+    #[test]
+    fn set_todos_maps_input_items_to_stable_todo_chip() {
+        // The pi todos extension's batch call: rawInput carries the FULL list.
+        let update = json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "t9",
+            "title": "set_todos",
+            "kind": "other",
+            "rawInput": {
+                "items": [
+                    { "id": "a", "text": "leer normalize", "status": "done" },
+                    { "id": "b", "text": "escribir tests", "status": "in_progress",
+                      "note": "en normalize.rs" },
+                    { "id": "c", "text": "cancelada", "status": "cancelled" },
+                    { "id": "d", "text": "pendiente", "status": "pending" },
+                ],
+            },
+        });
+        let events = map_update(&update);
+        // The ORIGINAL call keeps its real id and its own fold; the synthetic
+        // chip pair rides after it.
+        assert_eq!(events.len(), 3);
+        assert!(matches!(&events[0],
+            AgentEvent::ToolCall { id, call: ToolCall::Unknown { name, .. } }
+            if id == "t9" && name == "set_todos"));
+        assert_eq!(
+            events[1],
+            AgentEvent::ToolCall {
+                id: zeron_proto::LIVE_PLAN_TOOL_ID.into(),
+                call: ToolCall::Todo {
+                    items: vec![
+                        TodoItem { text: "leer normalize".into(), done: true },
+                        // in_progress + note folds into the text
+                        TodoItem { text: "escribir tests — en normalize.rs".into(), done: false },
+                        // cancelled counts as done
+                        TodoItem { text: "cancelada".into(), done: true },
+                        TodoItem { text: "pendiente".into(), done: false },
+                    ]
+                },
+            }
+        );
+        assert!(matches!(&events[2],
+            AgentEvent::ToolResult { id, is_error: false, .. }
+            if id == zeron_proto::LIVE_PLAN_TOOL_ID));
+    }
+
+    #[test]
+    fn update_todo_maps_output_echo_to_stable_todo_chip() {
+        // The patch call's full list only exists post-application, on the
+        // completion's rawOutput.details.todos — rawInput is a patch, never
+        // a list, and must not feed the chip.
+        let update = json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "t10",
+            "title": "update_todo",
+            "status": "completed",
+            "rawInput": { "id": "b", "status": "done" },
+            "rawOutput": {
+                "content": [{ "type": "text", "text": "{ emitted: true }" }],
+                "details": {
+                    "todos": [
+                        { "id": "a", "text": "leer", "status": "done" },
+                        { "id": "b", "text": "escribir", "status": "done" },
+                    ],
+                    "emitted": true,
+                },
+            },
+        });
+        let events = map_update(&update);
+        // Refreshed original call, its own result, then the synthetic pair.
+        assert_eq!(events.len(), 4);
+        assert!(matches!(&events[0], AgentEvent::ToolCall { id, .. } if id == "t10"));
+        assert!(matches!(&events[1], AgentEvent::ToolResult { id, .. } if id == "t10"));
+        assert_eq!(
+            events[2],
+            AgentEvent::ToolCall {
+                id: zeron_proto::LIVE_PLAN_TOOL_ID.into(),
+                call: ToolCall::Todo {
+                    items: vec![
+                        TodoItem { text: "leer".into(), done: true },
+                        TodoItem { text: "escribir".into(), done: true },
+                    ]
+                },
+            }
+        );
+        assert!(matches!(&events[3],
+            AgentEvent::ToolResult { id, is_error: false, .. }
+            if id == zeron_proto::LIVE_PLAN_TOOL_ID));
+    }
+
+    #[test]
+    fn todos_chip_sources_fall_back_and_stay_quiet() {
+        // A `set_todos` completion that drops rawInput still refreshes the
+        // chip from the extension's echo.
+        let completion = json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "t11",
+            "title": "set_todos",
+            "status": "completed",
+            "rawOutput": {
+                "content": [{ "type": "text", "text": "{ emitted: true }" }],
+                "details": { "todos": [ { "id": "a", "text": "solo", "status": "done" } ] },
+            },
+        });
+        assert!(matches!(map_update(&completion).as_slice(),
+            [_, _, AgentEvent::ToolCall { id, call: ToolCall::Todo { items }, .. }, _]
+            if id == zeron_proto::LIVE_PLAN_TOOL_ID && items.len() == 1));
+
+        // An update_todo OPENING (patch input, no echo yet) emits no chip —
+        // the list is unknown until the echo lands.
+        let opening = json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "t12",
+            "title": "update_todo",
+            "kind": "other",
+            "rawInput": { "id": "a", "status": "done" },
+        });
+        assert_eq!(map_update(&opening).len(), 1);
+
+        // An empty list still emits the pair — that is how a cleared todo
+        // list retires the chip.
+        let cleared = json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "t13",
+            "title": "set_todos",
+            "kind": "other",
+            "rawInput": { "items": [] },
+        });
+        assert!(matches!(map_update(&cleared).as_slice(),
+            [_, AgentEvent::ToolCall { id, call: ToolCall::Todo { items }, .. }, _]
+            if id == zeron_proto::LIVE_PLAN_TOOL_ID && items.is_empty()));
+
+        // Unrelated tools with list-shaped rawInput never feed the chip.
+        let other = json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "t14",
+            "title": "search_docs",
+            "kind": "other",
+            "rawInput": { "items": ["a", "b"] },
+        });
+        assert_eq!(map_update(&other).len(), 1);
+
+        // Foreign tool with details.todos + its own rawInput.items: echo wins,
+        // rawInput.items of the foreign tool is ignored.
+        let foreign = json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "t15",
+            "title": "search_docs",
+            "status": "completed",
+            "rawInput": { "items": [ { "text": "NO" } ] },
+            "rawOutput": {
+                "details": { "todos": [ { "id": "a", "text": "echo", "status": "pending" } ] },
+            },
+        });
+        let evs = map_update(&foreign);
+        let todo = evs.iter().find_map(|e| match e {
+            AgentEvent::ToolCall { id, call: ToolCall::Todo { items } }
+                if id == zeron_proto::LIVE_PLAN_TOOL_ID => Some(items.as_slice()),
+            _ => None,
+        });
+        assert_eq!(todo, Some([TodoItem { text: "echo".into(), done: false }].as_slice()));
+
+        // Failed set_todos retires the chip (empty list), no leftover optimistic items.
+        let failed = json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "t16",
+            "title": "set_todos",
+            "status": "failed",
+            "rawInput": { "items": [ { "id": "a", "text": "nope" } ] },
+        });
+        let failed_todo = map_update(&failed).iter().find_map(|e| match e {
+            AgentEvent::ToolCall { id, call: ToolCall::Todo { items } }
+                if id == zeron_proto::LIVE_PLAN_TOOL_ID => Some(items.len()),
+            _ => None,
+        });
+        assert_eq!(failed_todo, Some(0));
     }
 
     #[test]

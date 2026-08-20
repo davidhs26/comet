@@ -30,6 +30,7 @@
 mod normalize;
 mod subagent;
 mod subagent_opencode;
+mod subagent_pi;
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -55,6 +56,7 @@ use crate::{Harness, HarnessError, RunControls, Signal, send_signal, shutdown_ch
 use normalize::{map_update, parse_commands, preferred_allow_option};
 use subagent::SubagentTracker;
 use subagent_opencode::OpencodeTracker;
+use subagent_pi::PiTracker;
 
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(120);
 const DEFAULT_MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -362,15 +364,17 @@ fn pi_spec() -> AcpAgentSpec {
         executable: "pi-acp",
         env_override: "PI_ACP_EXECUTABLE",
         args: &[],
-        npm_package: Some("pi-acp@0.0.33"),
+        npm_package: Some("github:davidhs26/pi-acp#7a8548ca739f6da56ef8b90f36c683ed1fdf70e7"),
         extra_paths: npm_global_paths("pi-acp"),
         cli_executable: "pi",
         cli_extra_paths: || npm_global_bins("pi"),
         install_hint: "pi-acp (searched PATH, the login shell's PATH, npm global bins, \
-             and fnm/nvm/volta/pnpm/bun install dirs; zeron installs the pinned \
-             pi-acp automatically when npm is available — the pi CLI itself is \
-             still required, `npm install -g --ignore-scripts \
-             @earendil-works/pi-coding-agent`; set PI_ACP_EXECUTABLE to override)",
+             and fnm/nvm/volta/pnpm/bun install dirs; zeron installs our \
+             davidhs26/pi-acp fork pinned by full commit SHA (github spec, \
+             built by npm prepare — never the stale registry release) when npm \
+             is available — the pi CLI itself is still required, `npm install \
+             -g --ignore-scripts @earendil-works/pi-coding-agent`; set \
+             PI_ACP_EXECUTABLE to override)",
         // pi routes models through its own provider config (~/.pi); the picker
         // advertises the pass-through entry and pi keeps whatever the user set
         // up. Unknown ids are skipped by the config-option set.
@@ -390,8 +394,12 @@ fn pi_spec() -> AcpAgentSpec {
                 options: Vec::new(),
             }]
         },
-        // The adapter has no `_session/steering` extension: turn boundaries.
-        steering_mode: SteeringMode::TurnBoundary,
+        // The adapter implements the `_session/steering` extension bridging to
+        // pi's native RPC `steer` (delivered before the next LLM call): steers
+        // inject mid-turn. Runtime detection stays dynamic via
+        // `initialize._meta.steering.supported`, so an unpatched adapter
+        // degrades to boundary delivery instead of breaking.
+        steering_mode: SteeringMode::StepBoundary,
         // pi's thinking ladder (minimal→max; its extra "off" tier has no zeron
         // equivalent and is left to the agent default).
         reasoning_levels: &[
@@ -589,6 +597,38 @@ pub struct AcpHarness {
     models_probe: tokio::sync::Mutex<()>,
 }
 
+/// Child env marking a structural utility run (ID01-491). `ZERON_UTILITY=1`
+/// rides process inheritance: harness → pi-acp → pi, where extensions read
+/// `process.env.ZERON_UTILITY`. Inserted only for `utility: true`. A normal
+/// run *removes* the var so a parent that accidentally exported it cannot
+/// mark every session as utility (silent tool-block).
+pub(crate) const UTILITY_RUN_ENV: (&str, &str) = ("ZERON_UTILITY", "1");
+
+/// Assemble the child [`Command`] for an ACP run (unit-tested without a
+/// real agent): program + resolved args + PATH composition + cwd + the
+/// utility-run marker env.
+fn compose_child_command(
+    exe: &std::path::Path,
+    args: &[String],
+    extra_args: &[String],
+    cwd: Option<&str>,
+    utility: bool,
+) -> Command {
+    let mut cmd = Command::new(exe);
+    cmd.args(args);
+    cmd.args(extra_args);
+    crate::compose_child_path(&mut cmd, exe);
+    if let Some(cwd) = cwd.filter(|c| !c.is_empty()) {
+        cmd.current_dir(cwd);
+    }
+    if utility {
+        cmd.env(UTILITY_RUN_ENV.0, UTILITY_RUN_ENV.1);
+    } else {
+        cmd.env_remove(UTILITY_RUN_ENV.0);
+    }
+    cmd
+}
+
 impl AcpHarness {
     fn with_spec(spec: AcpAgentSpec) -> Self {
         Self {
@@ -776,15 +816,10 @@ impl AcpHarness {
         cwd: Option<&str>,
         block_on_install: bool,
         extra_args: &[String],
+        utility: bool,
     ) -> Result<(Child, crate::StderrTail), HarnessError> {
         let (exe, args) = self.resolve_program(block_on_install).await?;
-        let mut cmd = Command::new(&exe);
-        cmd.args(args);
-        cmd.args(extra_args);
-        crate::compose_child_path(&mut cmd, &exe);
-        if let Some(cwd) = cwd.filter(|c| !c.is_empty()) {
-            cmd.current_dir(cwd);
-        }
+        let mut cmd = compose_child_command(&exe, &args, extra_args, cwd, utility);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -816,7 +851,7 @@ impl AcpHarness {
     /// refuses sessions before login still surfaces whatever the handshake
     /// advertised.
     async fn discover_commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
-        let (mut child, _stderr) = self.spawn_agent(None, false, &[]).await?;
+        let (mut child, _stderr) = self.spawn_agent(None, false, &[], false).await?;
         let (client, mut incoming) = match (child.stdin.take(), child.stdout.take()) {
             (Some(stdin), Some(stdout)) => RpcClient::new(stdin, stdout),
             _ => {
@@ -880,7 +915,7 @@ impl AcpHarness {
     /// wire is the source of truth — the spec's static catalog only enriches
     /// matching entries and names the pick when the agent advertises nothing.
     async fn discover_models(&self) -> Result<Vec<Model>, HarnessError> {
-        let (mut child, stderr_tail) = self.spawn_agent(None, false, &[]).await?;
+        let (mut child, stderr_tail) = self.spawn_agent(None, false, &[], false).await?;
         let (client, _incoming) = match (child.stdin.take(), child.stdout.take()) {
             (Some(stdin), Some(stdout)) => RpcClient::new(stdin, stdout),
             _ => {
@@ -1254,7 +1289,7 @@ impl Harness for AcpHarness {
             None => Vec::new(),
         };
         let (mut child, stderr_tail) = self
-            .spawn_agent(Some(&request.cwd), true, &extra_args)
+            .spawn_agent(Some(&request.cwd), true, &extra_args, request.utility)
             .await?;
         let stdin = child
             .stdin
@@ -1614,12 +1649,14 @@ fn config_option_sets(
 }
 
 /// The per-agent subagent correlator: grok's spawn-tool + disk-tail tracker
-/// (inert for agents that never emit `subagent_*` updates), or opencode's
-/// task-chip + sidecar-bus tracker. Both observe the raw updates ahead of
-/// [`map_update`]; their tagged events flow from their own tasks.
+/// (inert for agents that never emit `subagent_*` updates), opencode's
+/// task-chip + sidecar-bus tracker, or pi's `subagents`-tool +
+/// machine-line + JSONL-tail tracker (ID01-482). All observe the raw updates
+/// ahead of [`map_update`]; their tagged events flow from their own tasks.
 enum SubagentObserver {
     Grok(SubagentTracker),
     Opencode(OpencodeTracker),
+    Pi(PiTracker),
 }
 
 impl SubagentObserver {
@@ -1627,6 +1664,7 @@ impl SubagentObserver {
         match self {
             SubagentObserver::Grok(tracker) => tracker.observe(update),
             SubagentObserver::Opencode(tracker) => tracker.observe(update),
+            SubagentObserver::Pi(tracker) => tracker.observe(update),
         }
     }
 }
@@ -1943,6 +1981,25 @@ fn steering_call_future(
     prompt_like_request(client.clone(), "_session/steering", params)
 }
 
+/// ID01-475 (2026-08-19): default OFF. The blanket quiet settle is
+/// superseded: turn end is deterministic via `_x.ai/session/prompt_complete`
+/// (grok) and via the `session/prompt` response itself (every agent);
+/// total initial silence is covered by grok's `prompt_stall` (other ACP
+/// agents have none); a genuinely quiet
+/// live turn is parked — recoverably — by the engine's quiesce watchdog
+/// instead of being falsely settled. On thinking-heavy agents the blanket
+/// killed live turns after 30s of stream silence (session
+/// `20-39-01-735Z`: gaps of 35-78s while grok-4.6 reasoned; 20 real edits,
+/// 0 errors, orphaned WIP). Re-habilitable with `ZERON_ACP_QUIET_SETTLE=1`.
+/// Read ONCE per process (OnceLock) — flipping it requires a restart.
+fn quiet_settle_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("ZERON_ACP_QUIET_SETTLE")
+            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    })
+}
+
 /// The per-run event loop: one task multiplexing agent messages, the pending
 /// turn, the steering mailbox, the interrupt token, and consumer liveness.
 async fn run_session(session: Session) {
@@ -2186,14 +2243,18 @@ async fn run_session(session: Session) {
     }
 
     // Subagent correlation + transcript tails: opencode rides its sidecar
-    // event bus; everything else gets the grok tracker (inert for agents
-    // that never emit the `subagent_*` extension updates).
+    // event bus; pi rides the `subagents` tool's machine-readable update
+    // lines + its own session JSONL under the transcript root (ID01-482);
+    // everything else gets the grok tracker (inert for agents that never
+    // emit the `subagent_*` extension updates).
     let mut subagents = if harness == HarnessId::Opencode {
         SubagentObserver::Opencode(OpencodeTracker::new(
             session_id.clone(),
             event_tx.clone(),
             sidecar_port.map(|p| format!("http://127.0.0.1:{p}")),
         ))
+    } else if harness == HarnessId::Pi {
+        SubagentObserver::Pi(PiTracker::new(event_tx.clone(), sessions_root))
     } else {
         SubagentObserver::Grok(SubagentTracker::new(
             session_id.clone(),
@@ -2274,14 +2335,22 @@ async fn run_session(session: Session) {
     // Done ever comes, and the session strands Working until the engine's
     // quiesce watchdog parks it.
     //
-    // `ZERON_ACP_QUIET_SETTLE_MS` overrides; 0 disables.
-    let quiet_settle: Option<Duration> = match std::env::var("ZERON_ACP_QUIET_SETTLE_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-    {
-        Some(0) => None,
-        Some(ms) => Some(Duration::from_millis(ms)),
-        None => Some(Duration::from_secs(30)),
+    // `ZERON_ACP_QUIET_SETTLE_MS` overrides; 0 disables. ID01-475: the
+    // whole watchdog is gated by `ZERON_ACP_QUIET_SETTLE` (default OFF,
+    // read once per process) — the MS knob only applies with the gate ON,
+    // so a stale `ZERON_ACP_QUIET_SETTLE_MS` in the environment does not
+    // re-arm it.
+    let quiet_settle: Option<Duration> = if !quiet_settle_enabled() {
+        None
+    } else {
+        match std::env::var("ZERON_ACP_QUIET_SETTLE_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            Some(0) => None,
+            Some(ms) => Some(Duration::from_millis(ms)),
+            None => Some(Duration::from_secs(30)),
+        }
     };
     let mut last_update_at = tokio::time::Instant::now();
     let mut turn_content_seen = false;
@@ -3130,6 +3199,36 @@ mod tests {
         if std::env::var_os(OPENCODE_STARTUP_TIMEOUT_ENV).is_none() {
             assert_eq!(harness.handshake_timeout, DEFAULT_OPENCODE_STARTUP_TIMEOUT);
         }
+    }
+
+    #[test]
+    fn utility_runs_carry_the_marker_env_and_normal_runs_do_not() {
+        // ID01-491: utility run exports ZERON_UTILITY=1; a normal run
+        // env_remove's it so a leaked parent value cannot inherit.
+        use std::ffi::OsStr;
+        use std::path::Path;
+
+        let empty: Vec<String> = Vec::new();
+        let utility_cmd =
+            compose_child_command(Path::new("/bin/agent"), &empty, &[], Some("/w"), true);
+        let marker = OsStr::new("ZERON_UTILITY");
+        assert_eq!(
+            utility_cmd
+                .as_std()
+                .get_envs()
+                .find(|(k, _)| **k == *marker),
+            Some((marker, Some(OsStr::new("1"))))
+        );
+        let normal_cmd =
+            compose_child_command(Path::new("/bin/agent"), &empty, &[], Some("/w"), false);
+        assert_eq!(
+            normal_cmd
+                .as_std()
+                .get_envs()
+                .find(|(k, _)| **k == *marker),
+            Some((marker, None)),
+            "normal run must env_remove ZERON_UTILITY"
+        );
     }
 
     #[test]

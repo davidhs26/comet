@@ -1,0 +1,25 @@
+name: ci
+# CI hosted apagado 2026-08-20 (facturaba en runners de GitHub; el gate
+# real es local: cargo tests + suites + golden + review adversarial).
+on:
+  workflow_dispatch:
+jobs:
+  rust:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: system deps (gpui)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libx11-dev libxcb1-dev libx11-xcb-dev \
+            libfontconfig1-dev libfreetype-dev libasound2-dev \
+            libvulkan-dev pkg-config cmake
+      - name: rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo check
+        run: cargo check --workspace --all-targets
+      - name: engine tests
+        run: cargo test -p zeron-engine

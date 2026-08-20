@@ -23,6 +23,8 @@ pub mod diff_sync;
 pub mod doc_host;
 pub mod instance_lock;
 pub mod local_import;
+pub mod model_allowlist;
+pub mod pi_adopt;
 pub mod profile;
 pub mod registry;
 pub mod repos;
@@ -51,7 +53,7 @@ pub use registry::{HarnessDescriptor, HarnessRegistry, default_registry};
 pub use repos::{CheckoutIdentity, Repos, worktree_branch_from_title};
 pub use rpc::EngineRpc;
 pub use run_journal::{JournalError, RunJournal};
-pub use sessions::{JournaledEvent, SessionsEngine, SteerOutcome};
+pub use sessions::{DRAINING_ERROR, JournaledEvent, SessionsEngine, SteerOutcome};
 pub use source_control::{
     BranchHeadContext, ChangeRequestError, ChangeRequestProvider, ChangeRequestResolution,
     ChangeRequestResolver, CheckoutChangeRequestLookup, CheckoutSourceContext, GitHubCli,
@@ -124,6 +126,9 @@ pub struct EngineCore {
     pub change_requests: CheckoutChangeRequests,
     pub diff_sync: CheckoutDiffSync,
     pub spaces_sync: SpacesSync,
+    /// External pi-session adoption loop (present only when the feature
+    /// flag is on).
+    pub pi_adopt: Option<pi_adopt::PiAdopt>,
     pub uploads: Uploads,
     pub agent_accounts: AgentAccounts,
     pub device_id: String,
@@ -282,6 +287,8 @@ impl EngineCore {
             turn_diff.note_turn_start(chat_id, cwd);
         }));
         let spaces_sync = SpacesSync::start(repos.clone(), workspace.clone(), &device_id);
+        // Adopt external pi sessions (feature-flagged; None = off, silent).
+        let pi_adopt = pi_adopt::PiAdopt::start(workspace.clone());
         Ok(Self {
             sessions,
             doc_host,
@@ -292,6 +299,7 @@ impl EngineCore {
             change_requests,
             diff_sync,
             spaces_sync,
+            pi_adopt,
             uploads,
             agent_accounts,
             device_id,
@@ -449,6 +457,23 @@ impl EngineCore {
         self.workspace.disconnect_edge();
     }
 
+    /// SPEC-ID01-459 C2: session-safe deploy drain. Flags the engine as
+    /// draining (new-run dispatch is rejected from here on; observation RPCs
+    /// and steers keep flowing) and waits — bounded by `timeout_secs` — for
+    /// every live run to settle NATURALLY. On timeout the caller's regular
+    /// teardown falls back to the per-chat interrupt path.
+    ///
+    /// `Engine::run` invokes this on SIGTERM and StopEngine (sign-out skips
+    /// it — the identity is going away, nothing is restarting), BEFORE
+    /// `server.abort()`, so the IPC keeps serving observation RPCs
+    /// while the in-flight turns finish.
+    pub async fn drain_for_restart(&self, timeout_secs: u64) {
+        self.sessions.begin_drain(timeout_secs);
+        self.sessions
+            .wait_for_drain(std::time::Duration::from_secs(timeout_secs))
+            .await;
+    }
+
     /// Graceful teardown: settle live runs (streaming entries stamped `aborted`),
     /// kill live PTYs, stamp our workspace `lastSeenAt`, and flush every open doc
     /// snapshot.
@@ -479,6 +504,9 @@ impl EngineCore {
         }
         self.diff_sync.shutdown().await;
         self.spaces_sync.shutdown().await;
+        if let Some(pi_adopt) = &self.pi_adopt {
+            pi_adopt.shutdown().await;
+        }
         self.doc_host.shutdown_workers().await;
         self.doc_host.flush_all();
         self.workspace.shutdown();
@@ -830,12 +858,19 @@ impl Engine {
         });
         let server = serve_ipc(config.ipc_port, service).await?;
 
-        tokio::select! {
-            result = shutdown_signal() => result?,
+        // biased: if SIGTERM/StopEngine and sign-out are both ready in the
+        // same tick, prefer the restart drain over the skip-drain sign-out path.
+        let exited_by_sign_out = tokio::select! {
+            biased;
+            result = shutdown_signal() => {
+                result?;
+                false
+            }
             requested = stop_rx.recv() => {
                 if requested.is_some() {
                     tracing::info!("headless shutdown requested over IPC");
                 }
+                false
             }
             _ = wait_for_signed_out(&mut auth_state), if workspace_scope == WorkspaceScope::Synced => {
                 // Edge transports observe the same auth signal and close at
@@ -844,9 +879,23 @@ impl Engine {
                 runtime.disconnect_edge();
                 tracing::info!("headless authentication revoked; stopping synced runtime");
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                true
             }
-        }
+        };
         tracing::info!("shutting down");
+        if !exited_by_sign_out {
+            // Session-safe shutdown (SPEC-ID01-459 C1/C2): flag draining +
+            // wait for the live turns to complete naturally BEFORE the IPC
+            // goes down, so a deploy never interrupts an in-flight run it
+            // could have kept. The wait is bounded; `shutdown()` below still
+            // interrupts on timeout.
+            let drain_timeout = runtime.core().sessions.drain_timeout_secs();
+            runtime.core().drain_for_restart(drain_timeout).await;
+        }
+        // Sign-out is NOT a restart (the spec freezes the drain for SIGTERM +
+        // StopEngine only): the identity is going away, so waiting up to the
+        // drain deadline — or answering with a "for a restart" rejection —
+        // buys nothing. Go straight to the interrupting teardown.
         server.abort();
         runtime.shutdown().await;
         Ok(())

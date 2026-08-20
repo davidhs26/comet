@@ -314,6 +314,7 @@ mod tests {
             attachments: Vec::new(),
             worktree: None,
             resume: None,
+            utility: false,
         }
     }
 }

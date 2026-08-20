@@ -4959,6 +4959,8 @@ impl Composer {
                             resume: None,
                             attachments: attachment_paths,
                             worktree: run_worktree,
+
+                            utility: false,
                         },
                         message_id: message_id.clone(),
                     }

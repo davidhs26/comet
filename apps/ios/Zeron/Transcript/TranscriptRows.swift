@@ -21,6 +21,9 @@ struct ToolItem: Hashable {
     var call: RenderToolCall
     var isError: Bool
     var resolved: Bool
+    /// Spawn-stamp fields when this part is an agent tool call (the minted
+    /// `Agent: {id} ({role})` call) — nil for every other tool.
+    var subagent: SubagentInfo? = nil
 }
 
 struct TranscriptRow: Identifiable {
@@ -126,7 +129,12 @@ enum TranscriptRowBuilder {
 
         func flushTools(lastIx: Int?) {
             guard !pendingTools.isEmpty else { return }
-            let autoOpen = streaming && lastIx == lastPartIx
+            // Groups that contain a spawn chip stay open: that's the only
+            // entry point to the child transcript on iOS (ID01-485). Without
+            // this, the chip collapses into "1 tool" the moment the parent
+            // writes more text or the turn settles.
+            let hasSubagent = pendingTools.contains { $0.subagent != nil }
+            let autoOpen = hasSubagent || (streaming && lastIx == lastPartIx)
             let id = "\(entry.id)#g\(groupIx)"
             var version = toolFingerprint(pendingTools)
             if autoOpen { version ^= 1 }
@@ -140,8 +148,14 @@ enum TranscriptRowBuilder {
 
         for (ix, part) in entry.parts.enumerated() {
             switch part {
-            case .tool(_, let call, let isError, let resolved):
-                pendingTools.append(ToolItem(call: call, isError: isError, resolved: resolved))
+            case .tool(_, let call, let isError, let resolved, let subagent):
+                // The `todo` part IS the status strip's HUD chip (ID01-503)
+                // — rendering it here too would duplicate it, so the phone
+                // skips it. The original set_todos/update_todo calls are
+                // untouched: they keep folding as common tools below.
+                guard call.tag != "todo" else { continue }
+                pendingTools.append(ToolItem(call: call, isError: isError, resolved: resolved,
+                                             subagent: subagent))
                 if ix == lastPartIx { flushTools(lastIx: ix) }
 
             case .text(let partId, let text):
@@ -224,6 +238,14 @@ enum TranscriptRowBuilder {
             }
             hash ^= UInt64(tool.call.fields.count) &+ (tool.isError ? 2 : 0) &+ (tool.resolved ? 4 : 0)
             hash = hash &* 0x100000001b3
+            // The spawn stamp rides here too: the call's own fields never
+            // change after minting, so without the status/tail in the
+            // fingerprint a running→done transition would leave the chip
+            // showing the stale state.
+            if let sub = tool.subagent {
+                hash ^= fnv1a("\(sub.docId)|\(sub.status.rawValue)|\(sub.tail ?? "")")
+                hash = hash &* 0x100000001b3
+            }
             for (k, v) in tool.call.fields.sorted(by: { $0.key < $1.key }) {
                 for byte in "\(k)=\(v)".utf8 {
                     hash ^= UInt64(byte)

@@ -9,6 +9,10 @@ enum Route: Hashable {
     case space(String)
     case chat(String)
     case newSession(spaceId: String)
+    /// Read-only subagent transcript push (ID01-485). The docId is the
+    /// child's session doc (`{chatId}--sub--{toolUseId}`) — NOT a registry
+    /// chat, so it never appears in the sessions list.
+    case subagent(parentChatId: String, docId: String)
 }
 
 struct HomeView: View {
@@ -44,6 +48,8 @@ struct HomeView: View {
                 case .space(let id): SpaceView(spaceId: id, path: $path)
                 case .chat(let id): SessionView(chatId: id)
                 case .newSession(let spaceId): NewSessionView(spaceId: spaceId, path: $path)
+                case .subagent(let parentChatId, let docId):
+                    SubagentView(parentChatId: parentChatId, docId: docId)
                 }
             }
             .toolbar {
@@ -117,6 +123,7 @@ struct HomeView: View {
             }
             .sheet(isPresented: $showNewSpace) {
                 NewSpaceSheet { spaceId in
+                    spaceFilter = spaceId
                     path.append(.space(spaceId))
                 }
             }
@@ -240,10 +247,16 @@ struct HomeView: View {
                         }
                     }
                 }
+                Divider()
+                Button {
+                    showNewSpace = true
+                } label: {
+                    Label("New space…", systemImage: "folder.badge.plus")
+                }
             } label: {
                 Image(systemName: "plus")
             }
-            .accessibilityLabel("New session")
+            .accessibilityLabel("New session or space")
         }
     }
 
