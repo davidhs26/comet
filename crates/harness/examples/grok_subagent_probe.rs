@@ -48,6 +48,8 @@ async fn main() {
         attachments: Vec::new(),
         worktree: None,
         resume: None,
+
+        utility: false,
     };
     let mut stream = AcpHarness::grok()
         .run(request, controls)

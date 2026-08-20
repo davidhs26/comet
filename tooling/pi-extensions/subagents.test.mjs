@@ -813,6 +813,42 @@ await test("gate de utilería SOLO evalúa el primer input: un mensaje posterior
 	await p;
 });
 
+await test("ID01-491 marker env: ZERON_UTILITY=1 con prompt SIN prefijo ⇒ cero spawns (cierra hueco steer/followUp)", async () => {
+	const fake = makeFakeSpawn();
+	const rt = createSubagentsRuntime({ spawnFn: fake.spawnFn });
+	const { pi, tools, handlers } = makeFakePi();
+	process.env.ZERON_UTILITY = "1";
+	try {
+		installSubagents(pi, rt);
+		// El prompt embebe una orden de spawn SIN el prefijo de utilería: solo
+		// el marker estructural del env puede detectar la sesión.
+		handlers.input({ text: "Lanzá DOS subagentes en paralelo y abrí el PR", source: "rpc" });
+		const r = await tools.subagents.execute("tc-env", { tasks: [{ id: "t1", prompt: "x" }] }, undefined, undefined);
+		assert.match(r.content[0].text, /utilería/, "rechaza con explicación");
+		assert.equal(fake.procs.length, 0, "marker env estructura la sesión: cero spawns");
+	} finally {
+		delete process.env.ZERON_UTILITY;
+	}
+});
+
+await test("ID01-491 marker env: ZERON_UTILITY != '1' (p.ej. '0') deja el gate off", async () => {
+	const fake = makeFakeSpawn();
+	const rt = createSubagentsRuntime({ spawnFn: fake.spawnFn });
+	const { pi, tools, handlers } = makeFakePi();
+	process.env.ZERON_UTILITY = "0";
+	try {
+		installSubagents(pi, rt);
+		handlers.input({ text: "Lanzá dos subagentes de verdad", source: "rpc" });
+		const p = tools.subagents.execute("tc-env0", { tasks: [{ id: "t1", prompt: "x" }] }, undefined, undefined);
+		await tick();
+		assert.equal(fake.procs.length, 1, "valor != '1' no activa el gate: spawn normal");
+		fake.finishProc(fake.procs[0], 0, null, "ok");
+		await p;
+	} finally {
+		delete process.env.ZERON_UTILITY;
+	}
+});
+
 // ---------- ID01-434: usage/costo + presupuesto + envelope ----------
 
 await test("usageFromSessionJsonl: suma assistant+toolResult+compaction; costUsd solo si hay cost.total", () => {

@@ -571,6 +571,38 @@ pub struct AcpHarness {
     models_cache: tokio::sync::OnceCell<Vec<Model>>,
 }
 
+/// Child env marking a structural utility run (ID01-491). `ZERON_UTILITY=1`
+/// rides process inheritance: harness → pi-acp → pi, where extensions read
+/// `process.env.ZERON_UTILITY`. Inserted only for `utility: true`. A normal
+/// run *removes* the var so a parent that accidentally exported it cannot
+/// mark every session as utility (silent tool-block).
+pub(crate) const UTILITY_RUN_ENV: (&str, &str) = ("ZERON_UTILITY", "1");
+
+/// Assemble the child [`Command`] for an ACP run (unit-tested without a
+/// real agent): program + resolved args + PATH composition + cwd + the
+/// utility-run marker env.
+fn compose_child_command(
+    exe: &std::path::Path,
+    args: &[String],
+    extra_args: &[String],
+    cwd: Option<&str>,
+    utility: bool,
+) -> Command {
+    let mut cmd = Command::new(exe);
+    cmd.args(args);
+    cmd.args(extra_args);
+    crate::compose_child_path(&mut cmd, exe);
+    if let Some(cwd) = cwd.filter(|c| !c.is_empty()) {
+        cmd.current_dir(cwd);
+    }
+    if utility {
+        cmd.env(UTILITY_RUN_ENV.0, UTILITY_RUN_ENV.1);
+    } else {
+        cmd.env_remove(UTILITY_RUN_ENV.0);
+    }
+    cmd
+}
+
 impl AcpHarness {
     fn with_spec(spec: AcpAgentSpec) -> Self {
         Self {
@@ -744,15 +776,10 @@ impl AcpHarness {
         cwd: Option<&str>,
         block_on_install: bool,
         extra_args: &[String],
+        utility: bool,
     ) -> Result<(Child, crate::StderrTail), HarnessError> {
         let (exe, args) = self.resolve_program(block_on_install).await?;
-        let mut cmd = Command::new(&exe);
-        cmd.args(args);
-        cmd.args(extra_args);
-        crate::compose_child_path(&mut cmd, &exe);
-        if let Some(cwd) = cwd.filter(|c| !c.is_empty()) {
-            cmd.current_dir(cwd);
-        }
+        let mut cmd = compose_child_command(&exe, &args, extra_args, cwd, utility);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -784,7 +811,7 @@ impl AcpHarness {
     /// refuses sessions before login still surfaces whatever the handshake
     /// advertised.
     async fn discover_commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
-        let (mut child, _stderr) = self.spawn_agent(None, false, &[]).await?;
+        let (mut child, _stderr) = self.spawn_agent(None, false, &[], false).await?;
         let (client, mut incoming) = match (child.stdin.take(), child.stdout.take()) {
             (Some(stdin), Some(stdout)) => RpcClient::new(stdin, stdout),
             _ => {
@@ -848,7 +875,7 @@ impl AcpHarness {
     /// wire is the source of truth — the spec's static catalog only enriches
     /// matching entries and names the pick when the agent advertises nothing.
     async fn discover_models(&self) -> Result<Vec<Model>, HarnessError> {
-        let (mut child, _stderr) = self.spawn_agent(None, false, &[]).await?;
+        let (mut child, _stderr) = self.spawn_agent(None, false, &[], false).await?;
         let (client, _incoming) = match (child.stdin.take(), child.stdout.take()) {
             (Some(stdin), Some(stdout)) => RpcClient::new(stdin, stdout),
             _ => {
@@ -1203,7 +1230,7 @@ impl Harness for AcpHarness {
             None => Vec::new(),
         };
         let (mut child, stderr_tail) = self
-            .spawn_agent(Some(&request.cwd), true, &extra_args)
+            .spawn_agent(Some(&request.cwd), true, &extra_args, request.utility)
             .await?;
         let stdin = child
             .stdin
@@ -3026,6 +3053,36 @@ async fn run_session(session: Session) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn utility_runs_carry_the_marker_env_and_normal_runs_do_not() {
+        // ID01-491: utility run exports ZERON_UTILITY=1; a normal run
+        // env_remove's it so a leaked parent value cannot inherit.
+        use std::ffi::OsStr;
+        use std::path::Path;
+
+        let empty: Vec<String> = Vec::new();
+        let utility_cmd =
+            compose_child_command(Path::new("/bin/agent"), &empty, &[], Some("/w"), true);
+        let marker = OsStr::new("ZERON_UTILITY");
+        assert_eq!(
+            utility_cmd
+                .as_std()
+                .get_envs()
+                .find(|(k, _)| **k == *marker),
+            Some((marker, Some(OsStr::new("1"))))
+        );
+        let normal_cmd =
+            compose_child_command(Path::new("/bin/agent"), &empty, &[], Some("/w"), false);
+        assert_eq!(
+            normal_cmd
+                .as_std()
+                .get_envs()
+                .find(|(k, _)| **k == *marker),
+            Some((marker, None)),
+            "normal run must env_remove ZERON_UTILITY"
+        );
+    }
 
     #[test]
     fn steering_capability_reads_initialize_meta() {

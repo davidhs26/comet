@@ -166,19 +166,12 @@ impl TitleGenerator {
              for a coding session that begins with this request:\n\n{prompt}"
         );
         for attempt in 0..=RETRY_DELAYS_MS.len() {
-            let request = RunRequest {
-                prompt: title_prompt.clone(),
-                harness: Some(harness_id),
-                model: cheap.clone(),
-                reasoning: Some(ReasoningLevel::Minimal),
-                model_options: serde_json::Map::new(),
-                cwd: cwd.to_string(),
-                sandbox: SandboxLevel::ReadOnly,
-                auto_approve: true,
-                attachments: Vec::new(),
-                resume: None,
-                worktree: None,
-            };
+            let request = title_run_request(
+                title_prompt.clone(),
+                harness_id,
+                cheap.clone(),
+                cwd,
+            );
             match collect_text(harness.as_ref(), request).await {
                 Ok(raw) => {
                     let candidate = clean_title(&raw);
@@ -276,6 +269,32 @@ fn clean_title(raw: &str) -> String {
 
 /// Drive one titling run through the harness: no steering, questions resolved
 /// empty immediately (a titling prompt must never block on input).
+/// The titling run's [`RunRequest`] — extracted so a unit test can pin its
+/// invariants (ID01-491): structurally marked `utility: true` (the ACP driver
+/// turns it into the child env `ZERON_UTILITY=1` that pi extensions gate on)
+/// and sandboxed read-only with minimal reasoning, fresh session.
+fn title_run_request(
+    title_prompt: String,
+    harness_id: HarnessId,
+    model: Option<String>,
+    cwd: &str,
+) -> RunRequest {
+    RunRequest {
+        prompt: title_prompt,
+        harness: Some(harness_id),
+        model,
+        reasoning: Some(ReasoningLevel::Minimal),
+        model_options: serde_json::Map::new(),
+        cwd: cwd.to_string(),
+        sandbox: SandboxLevel::ReadOnly,
+        auto_approve: true,
+        attachments: Vec::new(),
+        resume: None,
+        worktree: None,
+        utility: true,
+    }
+}
+
 async fn collect_text(
     harness: &dyn zeron_harness::Harness,
     request: RunRequest,
@@ -375,6 +394,25 @@ mod tests {
         assert_eq!(clean_title(raw), "Rol Specify Para Flota");
         // Negrita: el cierre ** no queda colgando.
         assert_eq!(clean_title("**Rol Specify Para Flota**"), "Rol Specify Para Flota");
+    }
+
+    #[test]
+    fn title_run_is_structurally_marked_utility_and_read_only() {
+        // ID01-491: el run de titulado lleva el marcador estructural (el driver
+        // ACP lo traduce en ZERON_UTILITY=1 para las extensiones de pi) y queda
+        // sandboxeado read-only, reasoning mínimo, sesión fresca.
+        let req = title_run_request(
+            format!("{TITLE_PROMPT_PREFIX} 3-5 word title …"),
+            HarnessId::Pi,
+            Some("cheap-model".into()),
+            "/w",
+        );
+        assert!(req.utility);
+        assert_eq!(req.sandbox, SandboxLevel::ReadOnly);
+        assert_eq!(req.reasoning, Some(ReasoningLevel::Minimal));
+        assert_eq!(req.resume, None);
+        assert!(req.auto_approve);
+        assert!(req.prompt.starts_with(TITLE_PROMPT_PREFIX));
     }
 
     #[test]

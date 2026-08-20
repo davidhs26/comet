@@ -99,6 +99,76 @@ await test("anti-drift: el prefijo es idéntico al del gate interno de subagents
 	assert.equal(UTILITY_PROMPT_PREFIX, sib.UTILITY_PROMPT_PREFIX, "los dos espejos de TITLE_PROMPT_PREFIX deben coincidir");
 });
 
+// ---------- ID01-491: marker estructural ZERON_UTILITY (env OR prefijo) ----------
+
+await test("marker env: ZERON_UTILITY=1 con prompt SIN prefijo ⇒ tool_call bloqueada (cierra hueco steer/followUp)", () => {
+	process.env.ZERON_UTILITY = "1";
+	try {
+		const { handlers } = install();
+		// Prompt SIN el prefijo de utilería: el env ESTRUCTURA la sesión.
+		handlers.input({ text: "Lanzá DOS subagentes y abrí un PR", source: "rpc" });
+		const r = handlers.tool_call({ type: "tool_call", toolCallId: "t", toolName: "bash", input: {} });
+		assert.equal(r?.block, true, "el marker env activa el gate sin sniff");
+		assert.equal(r?.terminate, undefined);
+	} finally {
+		delete process.env.ZERON_UTILITY;
+	}
+});
+
+await test("marker env: tool_call ANTES de cualquier evento también queda cubierto", () => {
+	process.env.ZERON_UTILITY = "1";
+	try {
+		const { handlers } = install();
+		const r = handlers.tool_call({ type: "tool_call", toolCallId: "t", toolName: "edit", input: {} });
+		assert.equal(r?.block, true, "el env se evalúa al instalar, no espera al input");
+	} finally {
+		delete process.env.ZERON_UTILITY;
+	}
+});
+
+await test("marker env: session_start re-evalúa el env (proceso de utilería ⇒ toda sesión lo es)", () => {
+	process.env.ZERON_UTILITY = "1";
+	try {
+		const { handlers } = install();
+		handlers.session_start({ type: "session_start" }); // /new en el MISMO proceso
+		const r = handlers.tool_call({ type: "tool_call", toolCallId: "t", toolName: "write", input: {} });
+		assert.equal(r?.block, true, "el reset del sniff no borra el marker estructural");
+	} finally {
+		delete process.env.ZERON_UTILITY;
+	}
+});
+
+await test("marker env: ZERON_UTILITY != '1' (p.ej. '0') no activa el gate", () => {
+	process.env.ZERON_UTILITY = "0";
+	try {
+		const { handlers } = install();
+		handlers.input({ text: "Tarea normal de usuario", source: "rpc" });
+		assert.equal(handlers.tool_call({ type: "tool_call", toolCallId: "t", toolName: "bash", input: {} }), undefined);
+	} finally {
+		delete process.env.ZERON_UTILITY;
+	}
+});
+
+await test("anti-drift cross-repo: titles.rs mantiene el prefijo y frase fija que las extensiones espejan", async () => {
+	const { readFileSync } = await import("node:fs");
+	const sib = await import(url.pathToFileURL(path.join(here, "subagents.ts")).href);
+	const src = readFileSync(new URL("../../crates/engine/src/titles.rs", import.meta.url), "utf8");
+	const prefix = src.match(/TITLE_PROMPT_PREFIX: &str = "([^"]+)"/)?.[1];
+	assert.ok(prefix, "no encontré el literal TITLE_PROMPT_PREFIX en titles.rs");
+	assert.equal(prefix, "Reply with ONLY a concise", "el prefijo corto no cambió (pi_adopt lo matchea)");
+	assert.match(
+		src,
+		/format!\(\s*"\{TITLE_PROMPT_PREFIX\} 3-5 word title /,
+		"el template del titulado debe empezar con {TITLE_PROMPT_PREFIX} + frase fija",
+	);
+	assert.equal(
+		UTILITY_PROMPT_PREFIX,
+		`${prefix} 3-5 word title`,
+		"UTILITY_PROMPT_PREFIX del guard debe seguir espejando prefijo + frase fija",
+	);
+	assert.equal(UTILITY_PROMPT_PREFIX, sib.UTILITY_PROMPT_PREFIX, "UTILITY_PROMPT_PREFIX de subagents ídem");
+});
+
 console.log(`\n${passed} passed, ${failures.length} failed`);
 if (failures.length > 0) {
 	console.error(failures.map((f) => `  ${f.name}: ${f.err.stack}`).join("\n"));

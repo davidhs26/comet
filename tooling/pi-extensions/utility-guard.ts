@@ -42,28 +42,50 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 /** Espejo de TITLE_PROMPT_PREFIX + frase fija en crates/engine/src/titles.rs. */
 export const UTILITY_PROMPT_PREFIX = "Reply with ONLY a concise 3-5 word title";
 
+/**
+ * Marker estructural ID01-491: el driver ACP del engine spawnea el child de un
+ * run marcado `utility: true` con env ZERON_UTILITY=1 — por-run, así que el
+ * env vive el proceso ENTERO (cubre también steer/followUp, que no emiten
+ * `input` y evadían el sniff). Se evalúa al momento de la detección
+ * (session_start / primer input); el sniff del prefijo queda como fallback
+ * pre-swap. Sin timers ni watchers. Dup a propósito respecto de subagents.ts:
+ * cada extensión debe funcionar sola (mismo criterio que el prefijo).
+ */
+function envMarksUtilityRun(): boolean {
+	return process.env.ZERON_UTILITY === "1";
+}
+
 export const BLOCK_REASON =
 	"utility-guard: sesión de utilería del engine (titulado) — todas las tools están deshabilitadas. Respondé SOLO el texto pedido por el prompt, sin ejecutar nada.";
 
 /** Wiring testeable: inyectá un `pi` mock. */
 export function installUtilityGuard(pi: ExtensionAPI): void {
-	let utilityRun = false;
+	// El env estructural se evalúa acá (y en cada session_start): un proceso
+	// nacido como utilería lo es desde el primer evento — incluso un tool_call
+	// que llegue antes del primer input queda cubierto.
+	let utilityRun = envMarksUtilityRun();
 	let firstInputSeen = false; // solo el PRIMER input decide (utilería = un prompt)
 
 	pi.on("session_start", () => {
 		// Un proceso pi puede servir más de una sesión (/new en TUI): cada
-		// sesión re-evalúa su primer input desde cero (hallazgo k3). Edge
-		// asumido: una sesión de utilería RESUMIDA no re-emite su input
-		// original, así que el gate queda off con la tarea embebida en el
-		// historial — nadie resume titulados hoy; el cierre real es ID01-491.
-		utilityRun = false;
+		// sesión re-evalúa su primer input desde cero (hallazgo k3). El env
+		// estructural (ID01-491) se re-evalúa acá también: si el PROCESO nació
+		// como utilería, toda sesión del proceso lo es. Edge asumido: una
+		// sesión de utilería RESUMIDA no re-emite su input original — el env
+		// la cubre; el cierre total es el marcador del engine (ID01-491).
+		utilityRun = envMarksUtilityRun();
 		firstInputSeen = false;
 	});
 
 	pi.on("input", (ev: { text?: string }) => {
 		if (firstInputSeen) return;
 		firstInputSeen = true;
-		if (typeof ev?.text === "string" && ev.text.startsWith(UTILITY_PROMPT_PREFIX)) utilityRun = true;
+		if (
+			!utilityRun &&
+			typeof ev?.text === "string" &&
+			ev.text.startsWith(UTILITY_PROMPT_PREFIX)
+		)
+			utilityRun = true;
 	});
 
 	pi.on("tool_call", () => {

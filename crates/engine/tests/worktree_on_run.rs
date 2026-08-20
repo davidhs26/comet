@@ -123,6 +123,7 @@ fn run_payload(message_id: &str, repo_path: &str) -> SessionCommandPayload {
                 repo_path: repo_path.into(),
                 base: "main".into(),
             }),
+            utility: false,
         },
         message_id: message_id.into(),
     }

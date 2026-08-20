@@ -119,6 +119,12 @@ pub struct RunRequest {
     /// host ignores it and runs in `cwd` (the repo's main checkout).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree: Option<WorktreeSpec>,
+    /// Structural utility-run marker (ID01-491): the ACP driver exports
+    /// `ZERON_UTILITY=1` in the child process spawned for this run so pi
+    /// extensions can disable tools without sniffing the prompt. Additive +
+    /// serde-defaulted for wire compat; every pre-existing run stays `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub utility: bool,
 }
 
 /// Isolated-worktree directive riding [`RunRequest`]. The worktree is created
@@ -423,6 +429,30 @@ mod tests {
         assert_eq!(json["worktree"]["repoPath"], "/repos/comet");
         let round: RunRequest = serde_json::from_value(json).unwrap();
         assert_eq!(round.worktree, req.worktree);
+    }
+
+    #[test]
+    fn run_request_utility_default_and_round_trip() {
+        // Old-wire JSON without the field parses (additive compat) ⇒ false…
+        let old = r#"{"prompt":"p","model":null,"reasoning":null,"cwd":".","sandbox":"workspace-write","resume":null}"#;
+        let req: RunRequest = serde_json::from_str(old).unwrap();
+        assert!(!req.utility);
+        // …and `false` serializes away (old readers never see it).
+        let json = serde_json::to_value(&req).unwrap();
+        assert!(json.get("utility").is_none());
+        // `"utility": true` round-trips; an explicit `false` on the wire too.
+        let req = RunRequest {
+            utility: true,
+            ..req
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["utility"], true);
+        let round: RunRequest = serde_json::from_value(json).unwrap();
+        assert!(round.utility);
+        let round_false: RunRequest =
+            serde_json::from_str(r#"{"prompt":"p","model":null,"reasoning":null,"cwd":".","sandbox":"workspace-write","resume":null,"utility":false}"#)
+                .unwrap();
+        assert!(!round_false.utility);
     }
 
     #[test]

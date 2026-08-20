@@ -1628,11 +1628,23 @@ const ThinkingSchema = Type.Union([
  */
 export const UTILITY_PROMPT_PREFIX = "Reply with ONLY a concise 3-5 word title";
 
+/**
+ * Marker estructural ID01-491: el driver ACP del engine spawnea el child de
+ * un run marcado `utility: true` con env ZERON_UTILITY=1 — por-run, así que
+ * el env vive el proceso ENTERO (cubre también steer/followUp, que no emiten
+ * `input` y evadían el sniff). Se evalúa al instalar y el sniff queda como
+ * fallback pre-swap. Dup a propósito respecto de utility-guard.ts: cada
+ * extensión debe funcionar sola (mismo criterio que el prefijo).
+ */
+function envMarksUtilityRun(): boolean {
+	return process.env.ZERON_UTILITY === "1";
+}
+
 /** Wiring testeable: inyectá runtime (spawn/now) y un `pi` mock. */
 export function installSubagents(pi: ExtensionAPI, runtime = createSubagentsRuntime()): void {
 	let agentLive = false; // agent_start → true, agent_settled → false (no agent_end: hay retries/compaction)
 	let shutdown = false;
-	let utilityRun = false; // sesión de utilería del engine (titulado): tools deshabilitadas
+	let utilityRun = envMarksUtilityRun(); // sesión de utilería del engine (titulado): tools deshabilitadas
 	let firstInputSeen = false; // el gate solo evalúa el PRIMER input (utilería = un prompt)
 
 	pi.on("agent_start", () => {
@@ -1644,7 +1656,12 @@ export function installSubagents(pi: ExtensionAPI, runtime = createSubagentsRunt
 	pi.on("input", (ev: { text?: string }) => {
 		if (firstInputSeen) return;
 		firstInputSeen = true;
-		if (typeof ev?.text === "string" && ev.text.startsWith(UTILITY_PROMPT_PREFIX)) utilityRun = true;
+		if (
+			!utilityRun &&
+			typeof ev?.text === "string" &&
+			ev.text.startsWith(UTILITY_PROMPT_PREFIX)
+		)
+			utilityRun = true;
 	});
 
 	/** Entrega un resultado como subagent-result (1 sendMessage por task, sin concatenar). */
