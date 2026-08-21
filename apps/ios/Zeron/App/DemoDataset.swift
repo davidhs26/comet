@@ -13,6 +13,7 @@ final class DemoDataset {
     var spaces: [Space]
     var chats: [Chat]
     var sessions: [String: SessionRow]
+    var changeRequests: [String: ChangeRequestSummary]
     private var stores: [String: SessionStore] = [:]
     private var streamTask: Task<Void, Never>?
 
@@ -20,11 +21,13 @@ final class DemoDataset {
         edgeURL: URL(string: "http://localhost:8787")!, mode: .dev,
         userId: "demo", orgId: "demo", deviceId: "ios-demo", deviceName: "iPhone")
 
-    init(devices: [DeviceRow], spaces: [Space], chats: [Chat], sessions: [String: SessionRow]) {
+    init(devices: [DeviceRow], spaces: [Space], chats: [Chat], sessions: [String: SessionRow],
+         changeRequests: [String: ChangeRequestSummary] = [:]) {
         self.devices = devices
         self.spaces = spaces
         self.chats = chats
         self.sessions = sessions
+        self.changeRequests = changeRequests
     }
 
     static func standard() -> DemoDataset {
@@ -86,8 +89,25 @@ final class DemoDataset {
                                       status: .awaitingInput, startedAt: now - 400_000,
                                       updatedAt: now - 10_000),
         ]
+        let changeRequests = [
+            "chat-veil": ChangeRequestSummary(
+                provider: "github", number: 90, title: "Stream pull request status on every client",
+                url: "https://github.com/zeron-sh/zeron/pull/90", state: .open,
+                baseRef: "main", headRef: "veil-fade"
+            ),
+            "chat-picker": ChangeRequestSummary(
+                provider: "github", number: 84, title: "Synchronize model catalogs",
+                url: "https://github.com/zeron-sh/zeron/pull/84", state: .merged,
+                baseRef: "main", headRef: "main"
+            ),
+            "chat-tabs": ChangeRequestSummary(
+                provider: "github", number: 77, title: "Refine tool group colors",
+                url: "https://github.com/zeron-sh/zeron/pull/77", state: .closed,
+                baseRef: "main", headRef: "main"
+            ),
+        ]
         return DemoDataset(devices: [mac, vps], spaces: [zeron, edge],
-                           chats: chats, sessions: sessions)
+                           chats: chats, sessions: sessions, changeRequests: changeRequests)
     }
 
     // MARK: Fake filesystem (folder browser demo)
@@ -108,11 +128,20 @@ final class DemoDataset {
 
     private static let repoNames: Set<String> = ["zeron", "dotfiles", "blog", "playground", "edge", "landing"]
 
-    func listFolders(deviceId: String, path: String) -> FolderListing {
-        let entries = (Self.fileTree[path] ?? []).map { name in
-            FolderEntry(name: name, isDir: true, isRepo: Self.repoNames.contains(name))
+    func listFolders(deviceId: String, path: String) -> FolderListing? {
+        if let names = Self.fileTree[path] {
+            let entries = names.map { name in
+                FolderEntry(name: name, isDir: true, isRepo: Self.repoNames.contains(name))
+            }
+            return FolderListing(path: path, entries: entries, truncated: false)
         }
-        return FolderListing(path: path, entries: entries, truncated: false)
+        // Leaf folder listed by its parent but with no further children.
+        let parent = (path as NSString).deletingLastPathComponent
+        let name = (path as NSString).lastPathComponent
+        if let kids = Self.fileTree[parent], kids.contains(name) {
+            return FolderListing(path: path, entries: [], truncated: false)
+        }
+        return nil
     }
 
     private var refsByPath: [String: [RepoRef]] = [:]

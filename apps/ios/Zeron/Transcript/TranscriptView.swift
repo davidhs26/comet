@@ -409,6 +409,7 @@ struct TranscriptView: View {
 
             case .toolGroup(let tools, let autoOpen):
                 ToolGroupView(tools: tools,
+                              chatId: chatId,
                               open: folds[row.id] ?? autoOpen,
                               userToggled: folds[row.id] != nil) {
                     withAnimation(reduceMotion ? nil : Motion.resize) {
@@ -495,7 +496,7 @@ final class TranscriptBuilderCache {
     /// does — gate on the revision and hand back the same array.
     func rows(revision: UInt64,
               entries: [MessageEntry],
-              pendingSends: [(messageId: String, text: String, at: Int64)]) -> [TranscriptRow] {
+              pendingSends: [PendingSend]) -> [TranscriptRow] {
         if cachedRevision == revision { return cachedRows }
         cachedRows = TranscriptRowBuilder.rows(entries: entries, pendingSends: pendingSends,
                                                parsers: &parsers, completed: &completed)
@@ -649,6 +650,8 @@ struct MarkdownRowView: View {
 
 struct ToolGroupView: View {
     let tools: [ToolItem]
+    /// The parent chat id — subagent chips push a subagent route scoped to it.
+    let chatId: String
     let open: Bool
     let userToggled: Bool
     let toggle: () -> Void
@@ -678,7 +681,7 @@ struct ToolGroupView: View {
             if open {
                 VStack(alignment: .leading, spacing: 0) {
                     ForEach(Array(tools.enumerated()), id: \.offset) { _, tool in
-                        ToolChipRow(tool: tool)
+                        ToolChipRow(tool: tool, chatId: chatId)
                     }
                 }
                 .padding(.top, 2)
@@ -690,8 +693,18 @@ struct ToolGroupView: View {
 /// 38pt row containing a 30pt card (transcript.rs tool_chip).
 struct ToolChipRow: View {
     let tool: ToolItem
+    /// Subagent chips navigate — the parent chat scopes the pushed route.
+    var chatId: String = ""
 
     var body: some View {
+        if let sub = tool.subagent {
+            subagentChip(sub)
+        } else {
+            plainChip
+        }
+    }
+
+    private var plainChip: some View {
         HStack(spacing: 0) {
             HStack(spacing: 8) {
                 Image(systemName: tool.call.chipSymbol)
@@ -716,6 +729,74 @@ struct ToolChipRow: View {
             .padding(.leading, 12)
         }
         .frame(height: 38)
+    }
+
+    /// Spawn chip (subagent_pi.rs: "the minted ToolCall IS the tab" on
+    /// desktop). Phone shape: one tappable chip — "Agent" label plus the
+    /// call's name as detail (the desktop relabel rule, view.rs:427-437:
+    /// `Agent: {id} ({role})` shows as label "Agent" + description), the
+    /// status word/icon distinguishing the three engine states, and the live
+    /// tail as a muted second line. The push target is the child's own doc.
+    private func subagentChip(_ sub: SubagentInfo) -> some View {
+        NavigationLink(value: Route.subagent(parentChatId: chatId, docId: sub.docId)) {
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 8) {
+                    Image(systemName: "person.2")
+                        .font(.system(size: 10))
+                        .foregroundStyle(Theme.textMuted)
+                        .frame(width: 18, height: 18)
+                        .background(whiteAlpha(0.08), in: RoundedRectangle(cornerRadius: 5))
+                    Text("Agent")
+                        .font(Theme.sans(12, weight: .medium))
+                        .foregroundStyle(Theme.text)
+                    Text(agentChipDetail(name: tool.call.string("name"),
+                                         fallback: sub.docId))
+                        .font(Theme.sans(12))
+                        .foregroundStyle(Theme.text.opacity(0.85))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Spacer(minLength: 8)
+                    subagentStatusBadge(sub.status)
+                }
+                if let tail = sub.tail, !tail.isEmpty {
+                    Text(tail)
+                        .font(Theme.sans(11))
+                        .foregroundStyle(Theme.textMuted.opacity(0.8))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .padding(.leading, 26)
+                }
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 5)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(whiteAlpha(0.03), in: RoundedRectangle(cornerRadius: 9))
+            .overlay(RoundedRectangle(cornerRadius: 9).strokeBorder(whiteAlpha(0.05), lineWidth: 1))
+            .contentShape(RoundedRectangle(cornerRadius: 9))
+        }
+        .buttonStyle(PressWashButtonStyle(cornerRadius: 9))
+        .padding(.leading, 12)
+        .padding(.trailing, 8)
+    }
+
+    /// Three distinguishable states (schema.rs `running | done | failed`).
+    /// The desktop's animated spinner is NOT required — a static glyph +
+    /// status word reads at a glance; failed carries the danger color.
+    private func subagentStatusBadge(_ status: SubagentStatus) -> some View {
+        let symbol: String, label: String, color: Color
+        switch status {
+        case .running: (symbol, label, color) = ("hourglass", "Running", Theme.accent)
+        case .done: (symbol, label, color) = ("checkmark.circle", "Done", Theme.textMuted)
+        case .failed: (symbol, label, color) = ("xmark.octagon", "Failed", Theme.danger)
+        }
+        return HStack(spacing: 4) {
+            Image(systemName: symbol)
+                .font(.system(size: 10))
+            Text(label)
+                .font(Theme.sans(11, weight: .medium))
+        }
+        .foregroundStyle(color)
+        .fixedSize()
     }
 }
 

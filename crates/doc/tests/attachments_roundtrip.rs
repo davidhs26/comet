@@ -16,7 +16,9 @@ fn run_request_attachments_survive_command_round_trip() {
         sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
         auto_approve: true,
         attachments: vec!["/tmp/a.png".into()],
+        worktree: None,
         resume: None,
+        utility: false,
     };
     doc.queue_command(&SessionCommandEntry {
         id: "c1".into(),

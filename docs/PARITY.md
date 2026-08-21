@@ -103,6 +103,29 @@ not built yet).
 - **Engine hardening**: single-instance lock, parent-PID watchdog, crash
   shield, idle reaper / stall watchdog, boot warm-open of recent chats.
 
+## iOS subagents (post-inventory — ID01-485)
+
+`apps/ios` grew after the §1–§8 audit (the "Mobile app" deferral above
+predates it). First post-audit surface documented here: subagent viewing,
+as an MVP.
+
+- **Spawn chip** — the engine stamps `subagentRef`/`subagentStatus`/
+  `subagentTail` on the parent chat's tool part (`crates/doc/src/schema.rs`);
+  iOS decodes the stamp and renders an "Agent" chip ("Agent" label + the
+  call's name as detail, status word/icon distinguishing running/done/failed,
+  live tail as a muted second line). Tapping pushes a read-only transcript of
+  the subagent doc: the store joins `chat2/{subDocId}/ws` — the room the
+  engine already routes the child's events to — with no composer, question
+  panel or any write surface. The subdoc is never registered as a chat, so it
+  can't appear in the sessions list.
+- **Known limitation** — the frozen blob (`blob/{chatId}/{subDocId}`) is NOT
+  consumed on iOS: the view watches the live doc only, so if the engine
+  restarted and dropped the live subdoc, the view renders empty. Desktop-only
+  for now: right-panel tabs, nested tab strips, jump pill, animated spinner.
+- **Gates** — the Swift build/tests need the Mac toolchain (target
+  `ZeronTests`; the Beelink has no `swiftc`), so "green iOS build" claims are
+  only valid from a Mac run.
+
 ## Summary
 
 Table rows above: **40 done · 6 partial**, plus the cross-cutting deferrals

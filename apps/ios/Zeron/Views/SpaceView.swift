@@ -20,12 +20,9 @@ struct SpaceView: View {
                 emptyState
             }
             ForEach(chats) { chat in
-                Button {
+                ChatRow(chat: chat, showLocation: true) {
                     path.append(.chat(chat.id))
-                } label: {
-                    ChatRow(chat: chat, showLocation: true)
                 }
-                .buttonStyle(PressWashButtonStyle())
                 .listRowBackground(Color.clear)
                 .listRowSeparator(.hidden)
                 .listRowInsets(EdgeInsets(top: 1, leading: 12, bottom: 1, trailing: 12))
@@ -134,6 +131,9 @@ struct NewSpaceSheet: View {
     @State private var loading = false
     @State private var error: String?
     @State private var creating = false
+    @State private var showPathField = false
+    @State private var pathDraft = ""
+    @State private var loadSeq = 0
 
     private var devices: [DeviceRow] {
         // Engines own folders; this phone can't. Offer every other device.
@@ -158,6 +158,11 @@ struct NewSpaceSheet: View {
                     breadcrumbBar
                         .padding(.horizontal, 20)
                         .padding(.bottom, 10)
+                    if showPathField {
+                        pathField
+                            .padding(.horizontal, 20)
+                            .padding(.bottom, 10)
+                    }
                     folderList
                 }
             }
@@ -174,6 +179,18 @@ struct NewSpaceSheet: View {
                             .font(.system(size: 13, weight: .semibold))
                     }
                     .accessibilityLabel("Close")
+                }
+                ToolbarItem(placement: .primaryAction) {
+                    Button {
+                        showPathField.toggle()
+                        if showPathField {
+                            pathDraft = listing?.path ?? pathDraft
+                        }
+                    } label: {
+                        Image(systemName: "text.cursor")
+                            .font(.system(size: 13, weight: .semibold))
+                    }
+                    .accessibilityLabel("Enter path")
                 }
             }
             .safeAreaInset(edge: .bottom) {
@@ -207,6 +224,8 @@ struct NewSpaceSheet: View {
                         UISelectionFeedbackGenerator().selectionChanged()
                         deviceId = device.id
                         listing = nil
+                        currentIsRepo = false
+                        pathDraft = ""
                     } label: {
                         HStack(spacing: 7) {
                             Circle()
@@ -224,6 +243,24 @@ struct NewSpaceSheet: View {
                     .buttonStyle(.plain)
                 }
             }
+        }
+    }
+
+    private var pathField: some View {
+        HStack(spacing: 8) {
+            TextField("Absolute path", text: $pathDraft)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .font(Theme.mono(12))
+                .foregroundStyle(Theme.text)
+                .padding(.horizontal, 12)
+                .frame(height: 36)
+                .background(whiteAlpha(0.06), in: Capsule())
+                .onSubmit { goToDraftPath() }
+            Button("Go") { goToDraftPath() }
+                .font(Theme.sans(13, weight: .medium))
+                .foregroundStyle(Theme.text)
+                .disabled(pathDraft.trimmingCharacters(in: .whitespaces).isEmpty || loading)
         }
     }
 
@@ -365,17 +402,36 @@ struct NewSpaceSheet: View {
 
     private func load(path: String?) async {
         guard let selectedDeviceId else { return }
+        loadSeq += 1
+        let seq = loadSeq
         loading = true
         error = nil
         let result = await model.listFolders(deviceId: selectedDeviceId, path: path)
+        guard seq == loadSeq else { return }
         loading = false
         if let result {
             withAnimation(Motion.fadeQuick) {
                 listing = result
             }
-        } else if listing == nil {
-            error = "Couldn't reach \(model.deviceName(selectedDeviceId)). Make sure it's online."
+            pathDraft = result.path
+        } else {
+            let name = model.deviceName(selectedDeviceId)
+            let detail = model.workspace?.lastRelayError
+            if let detail, !detail.isEmpty {
+                error = detail
+            } else if path == nil {
+                error = "Couldn't reach \(name). Make sure it's online."
+            } else {
+                error = "Couldn't open that path on \(name). Check it exists and is a folder."
+            }
         }
+    }
+
+    private func goToDraftPath() {
+        let trimmed = pathDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, !loading else { return }
+        currentIsRepo = false
+        Task { await load(path: trimmed) }
     }
 
     private func create() {

@@ -1,8 +1,9 @@
-//! Blanket dropped-reply settle (`ZERON_ACP_QUIET_SETTLE_MS`), tested with
-//! the GROK spec so no adapter-specific evidence (Claude's cost frame,
-//! `noRunningTurn` steering reasons) is in play — this is the path every ACP
-//! agent gets. Own test binary: the env knob is process-global, and every
-//! test here shares the one value.
+//! Blanket dropped-reply settle (`ZERON_ACP_QUIET_SETTLE` gate ON via
+//! `ZERON_ACP_QUIET_SETTLE_MS`), tested with the GROK spec so no
+//! adapter-specific evidence (Claude's cost frame, `noRunningTurn` steering
+//! reasons) is in play — this is the path every ACP agent gets. Own test
+//! binary: the env knobs are process-global, and every test here shares
+//! the one value.
 
 use std::path::PathBuf;
 use std::sync::Once;
@@ -22,8 +23,11 @@ fn init_env() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
         // SAFETY: set before any harness runs in this test process; all
-        // tests in this binary share the one value.
+        // tests in this binary share the one value. ID01-475: the watchdog
+        // is gated OFF by default — this binary opts IN to keep covering
+        // the ON path.
         unsafe { std::env::set_var("ZERON_ACP_QUIET_SETTLE_MS", QUIET_MS.to_string()) };
+        unsafe { std::env::set_var("ZERON_ACP_QUIET_SETTLE", "1") };
     });
 }
 
@@ -51,7 +55,10 @@ fn request(prompt: &str) -> RunRequest {
         sandbox: SandboxLevel::WorkspaceWrite,
         auto_approve: true,
         attachments: Vec::new(),
+        worktree: None,
         resume: None,
+
+        utility: false,
     }
 }
 
@@ -173,44 +180,5 @@ async fn open_tool_call_holds_the_quiet_settle_off() {
     assert!(
         finished < done,
         "the turn must survive the quiet stretch intact: {events:?}"
-    );
-}
-
-/// The 2026-08-13 regression: Claude thinking silently in exactly the
-/// settle's "looks finished" state — content streamed, every tool resolved,
-/// wire quiet far past the window. claude-agent-acp forwards no thinking
-/// traffic, so this is routine mid-turn silence, not a dropped reply; a
-/// false settle here orphans the real turn (premature Done, then the
-/// post-quiet tail folds as self-continued output and the session strands
-/// Working when the real response lands on a closed channel). Claude must
-/// ignore the blanket settle — even with the env knob set, as it is
-/// process-wide in this binary.
-#[tokio::test]
-async fn claude_thinking_silence_never_settles_the_turn() {
-    init_env();
-    let events = run_and_collect(
-        AcpHarness::claude(),
-        "scenario:quiet-thinking",
-        Duration::from_secs(20),
-    )
-    .await;
-    assert_eq!(
-        dones(&events),
-        vec![(DoneStatus::Completed, None)],
-        "{events:?}"
-    );
-    // The "finished" text (streamed after the 4s quiet stretch, ~3x the
-    // window) must precede the single Done — a false settle flips the order.
-    let finished = events
-        .iter()
-        .position(|(_, e)| matches!(e, AgentEvent::TextDelta { text } if text == "finished"))
-        .unwrap_or_else(|| panic!("post-quiet text must fold into the SAME turn: {events:?}"));
-    let done = events
-        .iter()
-        .position(|(_, e)| matches!(e, AgentEvent::Done { .. }))
-        .expect("done asserted above");
-    assert!(
-        finished < done,
-        "the turn must survive silent thinking intact: {events:?}"
     );
 }

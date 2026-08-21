@@ -24,6 +24,11 @@ struct SessionView: View {
     /// bottom boundary TranscriptView's correctPin re-pins against.
     @State private var scroll = ScrollState()
 
+    /// The to-do sheet's presentation (ID01-503): opened by tapping the
+    /// status strip's `⏳ d/n` chip. Presented OVER the layout — the
+    /// composer's position is never touched.
+    @State private var showTodosSheet = false
+
 
     private var chat: Chat? { model.chat(id: chatId) }
 
@@ -162,8 +167,14 @@ struct SessionView: View {
                     // The strip reserves its 24pt whether or not a run is
                     // live, so the composer never shifts. It sits on the
                     // solid floor right where the transcript's fade completes.
-                    statusStrip(chat: chat, status: status)
-                        .allowsHitTesting(false)
+                    // Hit-testing stays off salvo el retry affordance (upstream)
+                    // o el chip de to-dos visible (ID01-503): working muestra
+                    // cualquier lista no vacía; settled, solo pendientes.
+                    let todos = store.latestTodoItems
+                    let chipVisible = !(todos?.isEmpty ?? true)
+                        && (status == .working || todos?.contains(where: { !$0.done }) == true)
+                    statusStrip(chat: chat, status: status, store: store, todos: todos)
+                        .allowsHitTesting(model.sendState(for: chat) == .failed || chipVisible)
                     Group {
                         if let request = store.openInputRequest {
                             QuestionPanel(requestId: request.requestId, questions: request.questions) { requestId, answers in
@@ -205,6 +216,9 @@ struct SessionView: View {
             }
             .background(Theme.bg.ignoresSafeArea())
             .motionAnimation(Motion.fadeQuick, value: store.openInputRequest?.requestId)
+            .sheet(isPresented: $showTodosSheet) {
+                TodosSheet(items: store.latestTodoItems ?? [])
+            }
     }
 
     private func liveStatus(chat: Chat) -> SessionStatus? {
@@ -217,34 +231,111 @@ struct SessionView: View {
     /// Reserved 24pt status strip (shell.rs render_status_strip) — Working
     /// shows the sunrise spinner + rotating flavour word + elapsed; Errored
     /// shows "Run failed"; the strip always reserves its height so the
-    /// composer never shifts.
-    private func statusStrip(chat: Chat, status: SessionStatus?) -> some View {
+    /// composer never shifts. An unadopted send's truth takes precedence
+    /// ("Sending…" / "Queued" / "Not delivered — tap to retry"); the to-do
+    /// chip (ID01-503) rides the spinner line while working (`⏳ 2/5 · …`)
+    /// and persists solo tras el settle mientras haya pendientes.
+    private func statusStrip(chat: Chat, status: SessionStatus?, store: SessionStore,
+                             todos: [TodoDisplayItem]?) -> some View {
         TimelineView(.periodic(from: .now, by: 1)) { _ in
             HStack(spacing: 6) {
-                switch status {
-                case .working:
-                    WorkingSpinner()
-                    let startedAt = sessionStartedAt(chat: chat)
-                    let elapsed = (nowMs() - startedAt) / 1000
-                    Text("\(Motion.flavourWord(seed: Motion.flavourSeed(chat.id), elapsedSecs: elapsed))…")
-                        .font(Theme.sans(12))
-                        .foregroundStyle(Theme.textMuted)
-                    Text(Motion.formatElapsed(elapsed))
+                switch model.sendState(for: chat) {
+                case .failed?:
+                    Button {
+                        store.retryDelivery()
+                    } label: {
+                        Text("Not delivered — tap to retry")
+                            .font(Theme.sans(11))
+                            .foregroundStyle(Theme.danger)
+                    }
+                    .buttonStyle(.plain)
+                case .queued?:
+                    Circle()
+                        .fill(Theme.warning)
+                        .frame(width: 5, height: 5)
+                    Text("Queued — will send automatically")
                         .font(Theme.sans(11))
-                        .foregroundStyle(Theme.textFaint)
-                        .monospacedDigit()
-                case .errored:
-                    Text("Run failed")
-                        .font(Theme.sans(11))
-                        .foregroundStyle(Theme.danger)
-                default:
-                    EmptyView()
+                        .foregroundStyle(Theme.warning.opacity(0.9))
+                case .sending?:
+                    // The percent tracks the REAL relay transfer (escort
+                    // bytes committed to the host), not just local staging.
+                    if let progress = store.transferProgress {
+                        Text("Uploading… \(Int(progress * 100))%")
+                            .font(Theme.sans(11))
+                            .foregroundStyle(Theme.textMuted)
+                            .monospacedDigit()
+                    } else {
+                        Text("Sending…")
+                            .font(Theme.sans(11))
+                            .foregroundStyle(Theme.textMuted)
+                    }
+                case nil:
+                    normalStatus(chat: chat, status: status, todos: todos)
                 }
             }
             .frame(height: 24)
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.leading, 26)  // aligns with the composer's text start
         }
+    }
+
+    @ViewBuilder
+    private func normalStatus(chat: Chat, status: SessionStatus?,
+                              todos: [TodoDisplayItem]?) -> some View {
+        Group {
+                switch status {
+                case .working:
+                    if let todos, !todos.isEmpty {
+                        todoChip(todos)
+                    }
+                    WorkingSpinner()
+                    let startedAt = sessionStartedAt(chat: chat)
+                    let elapsed = (nowMs() - startedAt) / 1000
+                    Text("\(Motion.flavourWord(seed: Motion.flavourSeed(chat.id), elapsedSecs: elapsed))…")
+                        .font(Theme.sans(12))
+                        .foregroundStyle(Theme.textMuted)
+                        .lineLimit(1)
+                        .layoutPriority(-1)
+                    Text(Motion.formatElapsed(elapsed))
+                        .font(Theme.sans(11))
+                        .foregroundStyle(Theme.textFaint)
+                        .monospacedDigit()
+                        .fixedSize()
+                case .errored:
+                    if let todos, todos.contains(where: { !$0.done }) {
+                        todoChip(todos)
+                    }
+                    Text("Run failed")
+                        .font(Theme.sans(11))
+                        .foregroundStyle(Theme.danger)
+                default:
+                    // Settled (or idle): the chip persists only while
+                    // something is still pending.
+                    if let todos, todos.contains(where: { !$0.done }) {
+                        todoChip(todos)
+                    } else {
+                        EmptyView()
+                    }
+                }
+        }
+    }
+
+    /// `⏳ 2/5` — done over total (done already folds done+cancelled on the
+    /// wire). The strip's one tap target: opens the read-only to-do sheet.
+    private func todoChip(_ todos: [TodoDisplayItem]) -> some View {
+        let done = todos.filter(\.done).count
+        return Button {
+            showTodosSheet = true
+        } label: {
+            Text("⏳ \(done)/\(todos.count)")
+                .font(Theme.sans(12, weight: .medium))
+                .foregroundStyle(Theme.textMuted)
+                .monospacedDigit()
+                .lineLimit(1)
+                .fixedSize()
+        }
+        .buttonStyle(.plain)
+        .contentShape(Rectangle())
     }
 
     private func sessionStartedAt(chat: Chat) -> Int64 {

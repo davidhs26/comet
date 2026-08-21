@@ -17,17 +17,21 @@ use zeron_sync::DocsStore;
 
 pub mod agent_accounts;
 pub mod auth;
+pub mod change_requests;
 pub mod chat2_host;
 pub mod diff_sync;
 pub mod doc_host;
 pub mod instance_lock;
 pub mod local_import;
+pub mod model_allowlist;
+pub mod pi_adopt;
 pub mod profile;
 pub mod registry;
 pub mod repos;
 pub mod rpc;
 pub mod run_journal;
 pub mod sessions;
+pub mod source_control;
 pub mod spaces;
 pub mod terminals;
 pub mod titles;
@@ -36,6 +40,7 @@ pub mod workspace_host;
 
 pub use agent_accounts::{AgentAccounts, AgentAccountsConfig};
 pub use auth::{Auth, AuthConfig, AuthState, AuthUser, OrgMembership};
+pub use change_requests::{ChangeRequestCacheKey, CheckoutChangeRequests};
 pub use diff_sync::{
     CheckoutDiffSync, DiffFileTextPair, DiffSidecar, DiffSnapshot, TurnSnapshot,
     capture_commit_diff, capture_diff, capture_diff_against, capture_turn_diff, merge_base,
@@ -48,7 +53,12 @@ pub use registry::{HarnessDescriptor, HarnessRegistry, default_registry};
 pub use repos::{CheckoutIdentity, Repos, worktree_branch_from_title};
 pub use rpc::EngineRpc;
 pub use run_journal::{JournalError, RunJournal};
-pub use sessions::{JournaledEvent, SessionsEngine, SteerOutcome};
+pub use sessions::{DRAINING_ERROR, JournaledEvent, SessionsEngine, SteerOutcome};
+pub use source_control::{
+    BranchHeadContext, ChangeRequestError, ChangeRequestProvider, ChangeRequestResolution,
+    ChangeRequestResolver, CheckoutChangeRequestLookup, CheckoutSourceContext, GitHubCli,
+    GitRemote, parse_git_remote,
+};
 pub use spaces::SpacesSync;
 pub use terminals::Terminals;
 pub use titles::TitleGenerator;
@@ -113,8 +123,12 @@ pub struct EngineCore {
     pub registry: Arc<HarnessRegistry>,
     pub repos: Repos,
     pub terminals: Terminals,
+    pub change_requests: CheckoutChangeRequests,
     pub diff_sync: CheckoutDiffSync,
     pub spaces_sync: SpacesSync,
+    /// External pi-session adoption loop (present only when the feature
+    /// flag is on).
+    pub pi_adopt: Option<pi_adopt::PiAdopt>,
     pub uploads: Uploads,
     pub agent_accounts: AgentAccounts,
     pub device_id: String,
@@ -222,6 +236,10 @@ impl EngineCore {
         doc_host.set_workspace(workspace.clone());
         doc_host.set_sessions(sessions.clone());
         sessions.set_doc_host(doc_host.clone());
+        // Registry deaf-tripwire escalation: a registry redial sweeps the
+        // open chat2 rooms with probes. Weak capture — see
+        // `DocHost::deaf_escalation_hook` (graph-shutdown leak otherwise).
+        workspace.set_deaf_escalation_hook(doc_host.deaf_escalation_hook());
         match sessions.recover_stale() {
             Ok(0) => {}
             Ok(recovered) => tracing::info!(recovered, "stale sessions recovered on boot"),
@@ -229,6 +247,8 @@ impl EngineCore {
         }
         doc_host.spawn_transcript_salvage(profile.store_root().join("journals"));
         let repos = Repos::new(data_dir, &device_id);
+        doc_host.set_repos(repos.clone());
+        let change_requests = CheckoutChangeRequests::start(repos.clone(), &device_id);
         let terminals = Terminals::new();
         let uploads = Uploads::from_root_with_fallback(
             profile.uploads_root(),
@@ -243,6 +263,9 @@ impl EngineCore {
         {
             uploads.add_read_only_root(&root);
         }
+        // Queued-attachment support: the doc host resolves `pending://` refs
+        // against this store and pushes staged bytes to remote hosts.
+        doc_host.set_uploads(uploads.clone());
         let local_import = (profile.scope() == WorkspaceScope::Synced).then(|| {
             local_import::LocalImporter::new(
                 data_dir,
@@ -268,6 +291,8 @@ impl EngineCore {
             turn_diff.note_turn_start(chat_id, cwd);
         }));
         let spaces_sync = SpacesSync::start(repos.clone(), workspace.clone(), &device_id);
+        // Adopt external pi sessions (feature-flagged; None = off, silent).
+        let pi_adopt = pi_adopt::PiAdopt::start(workspace.clone());
         Ok(Self {
             sessions,
             doc_host,
@@ -275,8 +300,10 @@ impl EngineCore {
             registry,
             repos,
             terminals,
+            change_requests,
             diff_sync,
             spaces_sync,
+            pi_adopt,
             uploads,
             agent_accounts,
             device_id,
@@ -321,8 +348,10 @@ impl EngineCore {
         .clone()
     }
 
-    /// Attach the peer link cache — enables `targetDeviceId` routing and [`Self::dial_device`].
+    /// Attach the peer link cache — enables `targetDeviceId` routing,
+    /// [`Self::dial_device`], and the doc host's queued-attachment transfers.
     pub fn set_links(&self, links: Arc<zeron_rpc::LinkCache>) {
+        self.doc_host.set_links(links.clone());
         *self
             .links
             .lock()
@@ -402,6 +431,7 @@ impl EngineCore {
             self.registry.clone(),
             self.repos.clone(),
             self.terminals.clone(),
+            self.change_requests.clone(),
             self.diff_sync.clone(),
             self.uploads.clone(),
             self.agent_accounts.clone(),
@@ -431,6 +461,23 @@ impl EngineCore {
         self.workspace.disconnect_edge();
     }
 
+    /// SPEC-ID01-459 C2: session-safe deploy drain. Flags the engine as
+    /// draining (new-run dispatch is rejected from here on; observation RPCs
+    /// and steers keep flowing) and waits — bounded by `timeout_secs` — for
+    /// every live run to settle NATURALLY. On timeout the caller's regular
+    /// teardown falls back to the per-chat interrupt path.
+    ///
+    /// `Engine::run` invokes this on SIGTERM and StopEngine (sign-out skips
+    /// it — the identity is going away, nothing is restarting), BEFORE
+    /// `server.abort()`, so the IPC keeps serving observation RPCs
+    /// while the in-flight turns finish.
+    pub async fn drain_for_restart(&self, timeout_secs: u64) {
+        self.sessions.begin_drain(timeout_secs);
+        self.sessions
+            .wait_for_drain(std::time::Duration::from_secs(timeout_secs))
+            .await;
+    }
+
     /// Graceful teardown: settle live runs (streaming entries stamped `aborted`),
     /// kill live PTYs, stamp our workspace `lastSeenAt`, and flush every open doc
     /// snapshot.
@@ -438,6 +485,7 @@ impl EngineCore {
         self.sessions.shutdown().await;
         self.terminals.shutdown();
         self.agent_accounts.shutdown();
+        self.change_requests.shutdown();
         // Cancel + await every worker that can reach Edge before flushing: a
         // replaced synced runtime must not keep polling releases or draining
         // the attachment outbox under the old identity after Local boots.
@@ -460,6 +508,9 @@ impl EngineCore {
         }
         self.diff_sync.shutdown().await;
         self.spaces_sync.shutdown().await;
+        if let Some(pi_adopt) = &self.pi_adopt {
+            pi_adopt.shutdown().await;
+        }
         self.doc_host.shutdown_workers().await;
         self.doc_host.flush_all();
         self.workspace.shutdown();
@@ -694,6 +745,13 @@ impl Engine {
                 .as_deref()
                 .is_some_and(|token| !token.trim().is_empty()),
         };
+        if edge_enabled {
+            // OS network-path events (macOS NWPathMonitor): the instant the
+            // path returns every parked reconnect backoff redials, and while
+            // the OS says there is no path the dial loops park instead of
+            // burning attempts. No-op on platforms without a monitor.
+            zeron_sync::net_path::spawn_path_monitor();
+        }
         let device_id = load_or_create_device_id(profile.device_root())?;
         let edge = edge_enabled.then(|| {
             EdgeConfig::new(config.edge_url.clone(), Arc::new(auth.clone())).with_device(device_id)
@@ -743,10 +801,16 @@ impl Engine {
         zeron_harness::acp::prewarm_managed_adapters();
 
         let host_relay = edge.as_ref().map(|edge| {
-            let links = zeron_rpc::LinkCache::new(zeron_rpc::LinkCacheConfig::new(
-                edge.url.clone(),
-                Arc::new(auth.clone()),
-            ));
+            let mut link_config =
+                zeron_rpc::LinkCacheConfig::new(edge.url.clone(), Arc::new(auth.clone()));
+            // Registry-dark dial gate: devices with no recent presence fail
+            // fast with zero dials; presence returning un-parks them (the
+            // peer-alive hook below clears any cooldown at the same moment).
+            let workspace_for_liveness = core.workspace.clone();
+            link_config.liveness = Some(Arc::new(move |device_id: &str| {
+                workspace_for_liveness.peer_liveness(device_id)
+            }));
+            let links = zeron_rpc::LinkCache::new(link_config);
             let links_for_presence = links.clone();
             core.workspace
                 .set_peer_alive_hook(Arc::new(move |device_id: &str| {
@@ -798,12 +862,19 @@ impl Engine {
         });
         let server = serve_ipc(config.ipc_port, service).await?;
 
-        tokio::select! {
-            result = shutdown_signal() => result?,
+        // biased: if SIGTERM/StopEngine and sign-out are both ready in the
+        // same tick, prefer the restart drain over the skip-drain sign-out path.
+        let exited_by_sign_out = tokio::select! {
+            biased;
+            result = shutdown_signal() => {
+                result?;
+                false
+            }
             requested = stop_rx.recv() => {
                 if requested.is_some() {
                     tracing::info!("headless shutdown requested over IPC");
                 }
+                false
             }
             _ = wait_for_signed_out(&mut auth_state), if workspace_scope == WorkspaceScope::Synced => {
                 // Edge transports observe the same auth signal and close at
@@ -812,9 +883,23 @@ impl Engine {
                 runtime.disconnect_edge();
                 tracing::info!("headless authentication revoked; stopping synced runtime");
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                true
             }
-        }
+        };
         tracing::info!("shutting down");
+        if !exited_by_sign_out {
+            // Session-safe shutdown (SPEC-ID01-459 C1/C2): flag draining +
+            // wait for the live turns to complete naturally BEFORE the IPC
+            // goes down, so a deploy never interrupts an in-flight run it
+            // could have kept. The wait is bounded; `shutdown()` below still
+            // interrupts on timeout.
+            let drain_timeout = runtime.core().sessions.drain_timeout_secs();
+            runtime.core().drain_for_restart(drain_timeout).await;
+        }
+        // Sign-out is NOT a restart (the spec freezes the drain for SIGTERM +
+        // StopEngine only): the identity is going away, so waiting up to the
+        // drain deadline — or answering with a "for a restart" rejection —
+        // buys nothing. Go straight to the interrupting teardown.
         server.abort();
         runtime.shutdown().await;
         Ok(())

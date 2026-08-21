@@ -36,7 +36,10 @@ fn run_request(prompt: &str) -> RunRequest {
         sandbox: SandboxLevel::WorkspaceWrite,
         auto_approve: true,
         attachments: Vec::new(),
+        worktree: None,
         resume: None,
+
+        utility: false,
     }
 }
 
@@ -552,17 +555,26 @@ async fn processed_commands_are_skipped_on_redelivery() {
         },
     );
 
-    // Give the drain a moment: the command must be SKIPPED — no user entry, no run.
+    // Give the drain a moment: the command must not EXECUTE — no user entry,
+    // no run. But it must not stay a forever-Pending ghost either (v0.2.12
+    // swallowed-send: "Sending…" forever, retry a no-op): the dead-command
+    // sweep terminalizes it as Rejected so the doc tells the truth and a
+    // retry can mint a fresh attempt.
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(
         entries(&core).is_empty(),
         "skipped command must not execute"
     );
-    assert_eq!(
-        command_status(&core, "cmd-crashed"),
-        Some((SessionCommandStatus::Pending, None)),
-        "skip leaves the entry pending without an outcome"
-    );
+    wait_for(
+        || {
+            matches!(
+                command_status(&core, "cmd-crashed"),
+                Some((SessionCommandStatus::Rejected, _))
+            )
+        },
+        "crash-window command terminalized as Rejected",
+    )
+    .await;
     assert!(core.sessions.session_status(CHAT).is_none());
 
     // Direct ledger-evaluation check: re-evaluating a processed command = Skip.
@@ -582,6 +594,88 @@ async fn processed_commands_are_skipped_on_redelivery() {
         },
     );
     assert_eq!(verdict, zeron_doc::CommandDisposition::Skip);
+}
+
+/// The v0.2.12 field report: a send whose command was consumed by the ledger
+/// but never executed (crash between mark and resolve) was invisible to
+/// every retry — the drain filters processed ids, so the session was dead
+/// forever while new sessions worked. Retry must mint a FRESH attempt.
+#[tokio::test]
+async fn retry_reissues_a_swallowed_send() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let store = DocsStore::open(dir.path().join("orgs/dev-org/dev-user")).unwrap();
+        assert!(store.mark_processed("cmd-dead").unwrap());
+    }
+    let core = assemble(
+        dir.path(),
+        Arc::new(MockHarness {
+            script: mock_script(),
+        }),
+    );
+    let handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-dead",
+        SessionCommandPayload::Run {
+            request: run_request("try again"),
+            message_id: "m-retry".into(),
+        },
+    );
+    // The sweep terminalizes the dead attempt without executing it…
+    wait_for(
+        || {
+            matches!(
+                command_status(&core, "cmd-dead"),
+                Some((SessionCommandStatus::Rejected, _))
+            )
+        },
+        "dead attempt rejected",
+    )
+    .await;
+    assert!(entries(&core).is_empty(), "dead attempt must not execute");
+
+    // …and the user's retry mints a fresh attempt that actually runs.
+    core.doc_host.retry_delivery(CHAT).unwrap();
+    wait_for(
+        || {
+            entries_now(&core)
+                .iter()
+                .any(|e| e.id == "m-retry" && e.role == MessageRole::User)
+        },
+        "re-issued send writes the user entry",
+    )
+    .await;
+    wait_for(
+        || {
+            entries_now(&core)
+                .iter()
+                .any(|e| e.role == MessageRole::Assistant && e.status == Some(MessageStatus::Complete))
+        },
+        "re-issued send runs to completion",
+    )
+    .await;
+    let run_attempts = |cmds: &[SessionCommandEntry]| {
+        cmds.iter()
+            .filter(|c| {
+                matches!(&c.payload,
+                    SessionCommandPayload::Run { message_id, .. } if message_id == "m-retry")
+            })
+            .count()
+    };
+    assert_eq!(
+        run_attempts(&handle.doc().read_commands().unwrap()),
+        2,
+        "original + exactly one re-issue"
+    );
+    // A delivered message must never re-issue: retry while healthy is a no-op.
+    core.doc_host.retry_delivery(CHAT).unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        run_attempts(&handle.doc().read_commands().unwrap()),
+        2,
+        "retry after delivery must not duplicate the send"
+    );
 }
 
 #[tokio::test]
@@ -1659,6 +1753,9 @@ async fn real_claude_sees_uploaded_image_inline() {
         auto_approve: false,
         attachments: vec![path],
         resume: None,
+        worktree: None,
+
+        utility: false,
     };
     core.doc_host
         .queue_command(
@@ -1923,10 +2020,11 @@ async fn stale_tool_echo_after_steer_boundary_does_not_split_text() {
     );
 }
 
-/// The elapsed timer's base (`started_at`) is per user message: a settled
-/// session drops it (no reader can resurrect the previous turn's elapsed —
-/// the "timer opens at 30:00 on send" bug), and a steer into a PARKED
-/// persistent session restamps it fresh for the new turn.
+/// The elapsed timer's base (`started_at`) is per USER TASK: a parked
+/// persistent session (run handle alive) KEEPS it across the park, a user
+/// steer restamps it fresh (never resurface a previous task's 30min on
+/// send), and only a true settle (run handle gone) drops it — the "timer
+/// opens at 30:00 on send" bug stays fixed at the settle, not the park.
 #[tokio::test]
 async fn parked_steer_restamps_started_at_and_idle_clears_it() {
     // Steerable harness whose stream stays open after the turn's Done — the
@@ -2008,9 +2106,9 @@ async fn parked_steer_restamps_started_at_and_idle_clears_it() {
     )
     .await;
     let parked = core.sessions.session_status(CHAT).unwrap();
-    assert_eq!(
-        parked.started_at, None,
-        "a settled session must drop its timer base"
+    assert!(
+        parked.started_at.is_some(),
+        "a parked session (run handle alive) keeps its timer base"
     );
 
     let before_steer = chrono::Utc::now();
@@ -2035,9 +2133,146 @@ async fn parked_steer_restamps_started_at_and_idle_clears_it() {
     );
 
     wait_for(
-        || core.sessions.session_status(CHAT).map(|s| s.status) == Some(SessionStatus::Idle),
-        "turn two to settle",
+        || {
+            core.sessions.session_status(CHAT).is_some_and(|s| {
+                s.status == SessionStatus::Idle && s.started_at.is_none()
+            })
+        },
+        "turn two to settle (idle with the timer base dropped)",
     )
     .await;
-    assert_eq!(core.sessions.session_status(CHAT).unwrap().started_at, None);
+}
+
+/// A self-continued resume (parked session, agent-emitted output, NO user
+/// message) must NOT restamp `started_at`: the elapsed timer measures the
+/// USER'S task, so it keeps accumulating across the park + resume cycle
+/// instead of snapping back to 0:00.
+#[tokio::test]
+async fn self_continued_resume_keeps_started_at() {
+    // Steerable harness whose stream stays open after turn one's Done (the
+    // engine parks); past the RESUME_GATE it emits unprompted output — the
+    // self-continued shape (background-task wake) — and settles.
+    struct SelfContinuedHarness;
+    #[async_trait]
+    impl Harness for SelfContinuedHarness {
+        fn id(&self) -> HarnessId {
+            HarnessId::Mock
+        }
+        fn display_name(&self) -> &str {
+            "SelfContinued"
+        }
+        fn supports_steering(&self) -> bool {
+            true
+        }
+        fn steering_mode(&self) -> SteeringMode {
+            SteeringMode::StepBoundary
+        }
+        fn reasoning_levels(&self) -> &[ReasoningLevel] {
+            &[]
+        }
+        async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+            Ok(vec![])
+        }
+        async fn run(
+            &self,
+            _request: RunRequest,
+            controls: RunControls,
+        ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+            let (tx, rx) = tokio::sync::mpsc::channel::<Result<AgentEvent, HarnessError>>(16);
+            tokio::spawn(async move {
+                // Keep RunControls alive for the task's lifetime (the engine
+                // watches its drop) — same shape as the Parking harness above.
+                let _keep = controls;
+                let _ = tx
+                    .send(Ok(AgentEvent::TextDelta {
+                        text: "turn one".into(),
+                    }))
+                    .await;
+                // Hold Working open so the test's poll pins t0 on TURN ONE
+                // (not the resume) deterministically.
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                let _ = tx.send(Ok(done(DoneStatus::Completed))).await;
+                // Parked. Wait past RESUME_GATE (1s), then emit the
+                // self-continued turn — output nobody steered into.
+                tokio::time::sleep(Duration::from_millis(2500)).await;
+                let _ = tx
+                    .send(Ok(AgentEvent::TextDelta {
+                        text: "self-continued work".into(),
+                    }))
+                    .await;
+                // Hold Working open so the test's poll can observe it.
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                let _ = tx.send(Ok(done(DoneStatus::Completed))).await;
+                // Task ends: the stream closes and the run settles for real.
+            });
+            Ok(futures::stream::unfold(rx, |mut rx| async move {
+                rx.recv().await.map(|event| (event, rx))
+            })
+            .boxed())
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(dir.path(), Arc::new(SelfContinuedHarness));
+    let handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-run-self-continued-timer",
+        SessionCommandPayload::Run {
+            request: run_request("first"),
+            message_id: "m-1".into(),
+        },
+    );
+    wait_for(
+        || {
+            core.sessions.session_status(CHAT).is_some_and(|s| {
+                s.status == SessionStatus::Working && s.started_at.is_some()
+            })
+        },
+        "turn one working with a timer base",
+    )
+    .await;
+    let t0 = core
+        .sessions
+        .session_status(CHAT)
+        .unwrap()
+        .started_at
+        .expect("turn one carries a timer base");
+
+    // Turn one completes but the stream stays open: the session parks with
+    // the run handle alive, and the park must KEEP the base.
+    wait_for(
+        || {
+            core.sessions.session_status(CHAT).is_some_and(|s| {
+                s.status == SessionStatus::Idle && s.started_at == Some(t0)
+            })
+        },
+        "turn one to park (keeping the timer base)",
+    )
+    .await;
+
+    // Self-continued output (≥1s past the park) re-arms Working. The timer
+    // must CONTINUE: same base, no restamp.
+    wait_for(
+        || core.sessions.session_status(CHAT).map(|s| s.status) == Some(SessionStatus::Working),
+        "self-continued output to re-arm working",
+    )
+    .await;
+    let resumed = core.sessions.session_status(CHAT).unwrap();
+    assert_eq!(
+        resumed.started_at,
+        Some(t0),
+        "self-continued resume keeps the user task's timer base (no restamp)"
+    );
+
+    // Done + stream close settle the run for real: base dropped.
+    wait_for(
+        || {
+            core.sessions.session_status(CHAT).is_some_and(|s| {
+                s.status == SessionStatus::Idle && s.started_at.is_none()
+            })
+        },
+        "self-continued turn to settle (idle with the timer base dropped)",
+    )
+    .await;
 }

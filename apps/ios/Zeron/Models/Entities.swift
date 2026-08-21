@@ -13,6 +13,22 @@ struct DeviceRow: Identifiable, Hashable {
     var platform: String
     var lastSeenAt: Int64?
     var createdAt: Int64?
+    /// Engine version stamped by the device ("0.2.12"); gates the queued-
+    /// attachment flow and other capability checks. nil reads as "too old".
+    var version: String?
+}
+
+/// proto/src/lib.rs version_triple: parse a leading major.minor.patch,
+/// tolerating a -suffix or +build on the patch. Anything else is nil —
+/// version gates treat that as "too old".
+func versionTriple(_ raw: String) -> (Int, Int, Int)? {
+    let parts = raw.split(separator: ".", maxSplits: 2, omittingEmptySubsequences: false)
+    guard parts.count == 3, let major = Int(parts[0]), let minor = Int(parts[1]) else { return nil }
+    let digits = parts[2].prefix { $0.isNumber }
+    guard !digits.isEmpty, let patch = Int(digits) else { return nil }
+    let rest = parts[2].dropFirst(digits.count)
+    guard rest.isEmpty || rest.first == "-" || rest.first == "+" else { return nil }
+    return (major, minor, patch)
 }
 
 struct Space: Identifiable, Hashable {
@@ -85,6 +101,44 @@ struct SessionRow: Hashable {
     var status: SessionStatus
     var startedAt: Int64?
     var updatedAt: Int64
+}
+
+// MARK: - Checkout change requests
+
+/// Provider-neutral lifecycle state from `zeron-proto`.
+enum ChangeRequestState: String, Codable, Hashable {
+    case open
+    case closed
+    case merged
+
+    var label: String {
+        switch self {
+        case .open: return "Open"
+        case .closed: return "Closed"
+        case .merged: return "Merged"
+        }
+    }
+}
+
+struct ChangeRequestSummary: Codable, Hashable {
+    var provider: String
+    var number: UInt64
+    var title: String
+    var url: String
+    var state: ChangeRequestState
+    var baseRef: String
+    var headRef: String
+}
+
+/// Latest successful host-side resolution. A nil `changeRequest` is an
+/// authoritative successful lookup with no matching pull request.
+struct CheckoutChangeRequestStatus: Codable, Hashable {
+    var checkoutId: String
+    var deviceId: String
+    var cwd: String
+    var branch: String
+    var changeRequest: ChangeRequestSummary?
+    var updatedAt: String
 }
 
 // MARK: - Derived display status (entities.rs / state.rs ports)
@@ -177,15 +231,45 @@ struct RenderToolCall: Hashable {
     var string: (String) -> String? { { key in self.fields[key] as? String } }
 }
 
+/// Subagent spawn stamping (crates/doc/src/schema.rs:558-564): the engine
+/// writes these keys on the PARENT's tool part — the child's events never
+/// reach the parent transcript, they route to the child's own doc
+/// (crates/engine/src/sessions.rs:1483).
+struct SubagentInfo: Hashable {
+    /// Doc id of the child transcript: `{chatId}--sub--{toolUseId}`.
+    var docId: String
+    var status: SubagentStatus
+    /// One-line tail of the child's latest output.
+    var tail: String?
+}
+
+enum SubagentStatus: String, Hashable {
+    case running, done, failed
+}
+
+/// Desktop `view.rs` strip: Unknown named `Agent: {id} ({role})` shows
+/// as label "Agent" + the suffix as detail. Without the strip the chip
+/// reads "Agent  Agent: t1 (research)" — two labels fighting (ID01-485).
+func agentChipDetail(name: String?, fallback: String) -> String {
+    let raw = name ?? ""
+    if raw.hasPrefix("Agent: ") {
+        let suffix = String(raw.dropFirst("Agent: ".count))
+        return suffix.isEmpty ? fallback : suffix
+    }
+    if raw == "Agent" || raw.isEmpty { return fallback }
+    return raw
+}
+
 enum MessagePart: Hashable, Identifiable {
     case text(id: String, text: String)
-    case tool(id: String, call: RenderToolCall, isError: Bool, resolved: Bool)
+    case tool(id: String, call: RenderToolCall, isError: Bool, resolved: Bool,
+              subagent: SubagentInfo? = nil)
     case input(id: String, requestId: String, questions: [UserInputQuestion], resolved: Bool)
     case error(id: String, message: String)
 
     var id: String {
         switch self {
-        case .text(let id, _), .tool(let id, _, _, _), .input(let id, _, _, _), .error(let id, _):
+        case .text(let id, _), .tool(let id, _, _, _, _), .input(let id, _, _, _), .error(let id, _):
             return id
         }
     }
@@ -245,6 +329,15 @@ struct RepoRef: Codable, Hashable, Identifiable {
 
 let commandDefaultTtlMs: Int64 = 86_400_000
 
+/// zeron-proto WorktreeSpec (agent.rs, PR #159): a worktree the HOST
+/// materializes at command-drain time — the client never blocks on a
+/// CreateWorktree relay RPC before a send. Old hosts ignore the field and run
+/// in `cwd` (the repo's main checkout): degraded, never hung.
+struct WorktreeSpec: Codable, Hashable {
+    var repoPath: String
+    var base: String
+}
+
 /// zeron-proto RunRequest (agent.rs:81). `reasoning` is lowercase
 /// ("high"/"xhigh"/…), `sandbox` kebab-case ("workspace-write"), harness ids
 /// kebab-case ("claude-code").
@@ -262,10 +355,15 @@ struct RunRequest: Codable {
     var autoApprove: Bool = true
     var resume: String?
     /// Absolute paths of image attachments already staged on the run device
-    /// (UploadChunk/UploadCommit). The same paths ride the prompt text as
-    /// `Attached images (local files …)` refs — this field additionally lets
+    /// (UploadChunk/UploadCommit) — or `pending://{uploadId}/{name}` refs on
+    /// the queued flow (host ≥ 0.2.12), which the host resolves to absolute
+    /// paths once the bytes land. The same refs ride the prompt text as
+    /// `Attached images (local files …)` lines — this field additionally lets
     /// a harness inline the bytes as image content blocks.
     var attachments: [String] = []
+    /// Worktree for the host to materialize at drain time (PR #159). Omitted
+    /// from the JSON when nil, so old hosts see the legacy shape.
+    var worktree: WorktreeSpec?
 }
 
 enum SessionCommandPayload {
