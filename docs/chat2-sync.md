@@ -134,6 +134,12 @@ root).
   History trim: shallow checkpoint only at a frontier older than RETAIN_DAYS, same
   aged-frontier discipline as today (the ws4 live-frontier lesson: an offline device's
   concurrent ops must never land behind a shallow root).
+- Turn-end delivery seal (`seal_turn`, 2026-08-21): every turn finalize probes the
+  room socket (deaf → 10s deadline → redial+flush) and posts a `turn-end` checkpoint
+  unless the room provably covers the cursor with nothing pending — the final
+  message must never depend on the WS path alone, and a fresh checkpoint is the
+  jump point that heals readers wedged on a row gap. The registry deaf-tripwire's
+  redial additionally sweeps all open rooms with probes (`probe_open_chats`).
 - Tail sidecar: publish last-64 JSON on the debounced commit tick (dirty-flag, like
   the DO's current lazy recompute). Diff sidecar publish moves from `diff_sync.rs`'s
   DO PUT to the chat2 PUT unchanged.

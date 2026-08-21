@@ -1835,6 +1835,11 @@ async fn drive_run(
                         tracing::warn!(chat = %chat_id, error = %err, "quiesce segment finish failed");
                     }
                     inner.note_message(&chat_id, &folded_text(&folded));
+                    // The quiesce park finalizes a user-visible segment —
+                    // seal its delivery like a real turn end.
+                    if let Some(host) = inner.doc_host() {
+                        host.seal_turn(&chat_id);
+                    }
                 }
                 folded.clear();
                 dirty = false;
@@ -2340,6 +2345,13 @@ async fn drive_run(
                     tracing::warn!(chat = %chat_id, error = %err, "final segment finish failed");
                 }
                 inner.note_message(&chat_id, &folded_text(&folded));
+            }
+            // Turn-end delivery seal: verify the room socket is live and post
+            // the final content as a checkpoint — see `DocHost::seal_turn`
+            // (2026-08-21 frozen-final-message incident). Every Done shape
+            // seals: an interrupted/errored turn's last words matter too.
+            if let Some(host) = inner.doc_host() {
+                host.seal_turn(&chat_id);
             }
             if *status == DoneStatus::Completed {
                 // A cleanly completed turn resets the auto-resume revival

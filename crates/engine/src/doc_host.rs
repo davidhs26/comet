@@ -1683,13 +1683,24 @@ impl DocHost {
                     edge_tail.url.trim_end_matches('/'),
                     chat
                 );
-                let _ = http
+                // Logged on failure: the tail is the thin readers' fallback
+                // path, and a silently failing PUT looked exactly like a
+                // healthy publish while phones read a stale transcript
+                // (2026-08-21 incident forensics had zero signal here).
+                match http
                     .put(&url)
                     .bearer_auth(&bearer)
                     .header("content-type", "application/json")
                     .body(body)
                     .send()
-                    .await;
+                    .await
+                {
+                    Ok(res) if res.status().is_success() => {}
+                    Ok(res) => tracing::warn!(chat = %chat,
+                        status = res.status().as_u16(), "chat2 tail publish rejected"),
+                    Err(err) => tracing::warn!(chat = %chat,
+                        error = %err, "chat2 tail publish failed"),
+                }
             });
         }
         // Threshold checkpoint (rowBytes > 512KB || rows > 200), one in
@@ -1772,6 +1783,40 @@ impl DocHost {
             }
             in_flight.store(false, Ordering::Release);
         });
+    }
+
+    /// Turn-end delivery seal (2026-08-21 frozen-final-message incident):
+    /// the moment a turn finalizes is exactly when a deaf socket or a wedged
+    /// reader is costliest — the journal says "done" while the phone never
+    /// hears it. Two moves, both on existing primitives:
+    /// - probe the chat2 client NOW: a deaf socket misses `PROBE_DEADLINE`
+    ///   (10s) and redials — flushing its unacked pushes — instead of
+    ///   waiting out the 15-min quiet cadence;
+    /// - post a "turn-end" checkpoint: plain HTTP, so the final content
+    ///   reaches the room even while the WS is deaf, and a fresh checkpoint
+    ///   is the jump point that heals any reader holding its cursor over a
+    ///   row gap (the same cure an engine restart applied by accident).
+    /// Skipped only when the room provably covers everything already
+    /// (server state known, a checkpoint at/after the cursor, nothing
+    /// pending) — rare right after a real turn.
+    pub fn seal_turn(&self, chat_id: &str) {
+        let Some(handle) = lock(&self.inner.handles).get(chat_id).cloned() else {
+            return;
+        };
+        let stats = {
+            let client = lock(&handle.chat2);
+            let Some(client) = &*client else { return };
+            client.probe();
+            client.stats()
+        };
+        let covered = stats.server_known
+            && stats.checkpoint_size > 0
+            && stats.cursor <= stats.checkpoint_seq
+            && stats.pending_pushes == 0;
+        if covered {
+            return;
+        }
+        self.spawn_chat2_checkpoint(&handle, "turn-end");
     }
 
     /// LRU eviction: while the warm set exceeds [`WARM_DOC_CAP`] or the
@@ -1874,7 +1919,23 @@ impl DocHost {
         }
     }
 
-    /// Probe every open chat's room (window-focus liveness sweep). Each
+    /// The registry deaf-tripwire's escalation hook: a registry redial marks
+    /// the whole network path suspect, so sibling chat rooms verify too (via
+    /// [`Self::probe_open_chats`]). Captures only a Weak of the graph — the
+    /// workspace host owns the hook slot, and a strong `DocHost` there would
+    /// cycle the engine graph past shutdown (`local_first` leak test).
+    pub fn deaf_escalation_hook(&self) -> crate::workspace_host::DeafEscalationHook {
+        let weak = Arc::downgrade(&self.inner);
+        Arc::new(move || {
+            if let Some(inner) = weak.upgrade() {
+                DocHost { inner }.probe_open_chats();
+            }
+        })
+    }
+
+    /// Probe every open chat's room (window-focus liveness sweep; also the
+    /// registry deaf-tripwire's escalation — a registry redial marks the
+    /// whole network path suspect, so sibling rooms verify too). Each
     /// room ignores the hint unless it has been broadcast-quiet ≥30s.
     pub fn probe_open_chats(&self) {
         let handles: Vec<Arc<ChatDocHandle>> =

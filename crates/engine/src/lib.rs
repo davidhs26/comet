@@ -236,6 +236,10 @@ impl EngineCore {
         doc_host.set_workspace(workspace.clone());
         doc_host.set_sessions(sessions.clone());
         sessions.set_doc_host(doc_host.clone());
+        // Registry deaf-tripwire escalation: a registry redial sweeps the
+        // open chat2 rooms with probes. Weak capture — see
+        // `DocHost::deaf_escalation_hook` (graph-shutdown leak otherwise).
+        workspace.set_deaf_escalation_hook(doc_host.deaf_escalation_hook());
         match sessions.recover_stale() {
             Ok(0) => {}
             Ok(recovered) => tracing::info!(recovered, "stale sessions recovered on boot"),

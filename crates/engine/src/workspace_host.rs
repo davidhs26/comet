@@ -174,6 +174,8 @@ struct WorkspaceHostInner {
     peer_alive: Mutex<Option<PeerAliveHook>>,
     /// Deaf-socket tripwire state — see `check_presence_deafness`.
     presence_watch: Mutex<PresenceWatch>,
+    /// See [`DeafEscalationHook`].
+    deaf_escalation: Mutex<Option<DeafEscalationHook>>,
     /// Epoch ms of the registry room's most recent (re)join — the dial gate's
     /// warm-up clock (`peer_liveness`): a just-joined room hasn't heard
     /// anyone's heartbeat yet, and that silence must not read as "offline".
@@ -182,6 +184,16 @@ struct WorkspaceHostInner {
 
 /// "This peer is alive" callback (device id) — see `WorkspaceHost::set_peer_alive_hook`.
 pub type PeerAliveHook = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// Deaf-socket escalation callback — fired (spawned, never inline under the
+/// room/presence locks) when the presence tripwire redials the registry room.
+/// The registry socket proving deaf is the strongest available signal that
+/// sibling room sockets on the same network path are deaf too, so the host
+/// sweeps its open chat2 rooms with liveness probes (free on healthy rooms;
+/// a deaf one misses its probe deadline and redials). Restores the chat-sweep
+/// half of the retired tripwire escalation on the current primitives
+/// (2026-08-21 frozen-final-message incident).
+pub type DeafEscalationHook = Arc<dyn Fn() + Send + Sync>;
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
@@ -291,6 +303,7 @@ impl WorkspaceHost {
                 presence_seen: Mutex::new(std::collections::HashMap::new()),
                 peer_alive: Mutex::new(None),
                 presence_watch: Mutex::new(PresenceWatch::default()),
+                deaf_escalation: Mutex::new(None),
                 room_joined_at: std::sync::atomic::AtomicI64::new(0),
             }),
         };
@@ -469,6 +482,11 @@ impl WorkspaceHost {
     /// the engine points this at `LinkCache::reset_cooldown`.
     pub fn set_peer_alive_hook(&self, hook: PeerAliveHook) {
         *lock(&self.inner.peer_alive) = Some(hook);
+    }
+
+    /// See [`DeafEscalationHook`].
+    pub fn set_deaf_escalation_hook(&self, hook: DeafEscalationHook) {
+        *lock(&self.inner.deaf_escalation) = Some(hook);
     }
 
     /// Test seam: write a foreign device row (the relay version gate and the
@@ -1195,6 +1213,16 @@ impl WorkspaceHostInner {
             watch.armed = false;
             watch.dark_since_ms = 0;
             watch.probed = false;
+            // The network path just proved bad enough to need a fresh
+            // socket — sweep the open chat2 rooms too. Spawned: this runs
+            // under the room + presence-seen locks, and the hook takes the
+            // doc-host handles lock (the retired escalation's review caught
+            // an AB-BA here; never invoke hooks inline under these guards).
+            if let Some(hook) = lock(&self.deaf_escalation).clone()
+                && let Ok(runtime) = tokio::runtime::Handle::try_current()
+            {
+                runtime.spawn(async move { hook() });
+            }
         }
     }
 
