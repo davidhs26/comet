@@ -2345,13 +2345,17 @@ async fn drive_run(
                     tracing::warn!(chat = %chat_id, error = %err, "final segment finish failed");
                 }
                 inner.note_message(&chat_id, &folded_text(&folded));
-            }
-            // Turn-end delivery seal: verify the room socket is live and post
-            // the final content as a checkpoint — see `DocHost::seal_turn`
-            // (2026-08-21 frozen-final-message incident). Every Done shape
-            // seals: an interrupted/errored turn's last words matter too.
-            if let Some(host) = inner.doc_host() {
-                host.seal_turn(&chat_id);
+                // Turn-end delivery seal: verify the room socket is live and
+                // post the final content as a checkpoint — see
+                // `DocHost::seal_turn` (2026-08-21 frozen-final-message
+                // incident). Every Done shape that WROTE something seals —
+                // interrupted/errored last words matter too; a
+                // nothing-streamed teardown (reaper, drain) has nothing new
+                // to seal and must not post N checkpoints on shutdown
+                // (review k3).
+                if let Some(host) = inner.doc_host() {
+                    host.seal_turn(&chat_id);
+                }
             }
             if *status == DoneStatus::Completed {
                 // A cleanly completed turn resets the auto-resume revival

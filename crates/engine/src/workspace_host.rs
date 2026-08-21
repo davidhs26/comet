@@ -1218,10 +1218,17 @@ impl WorkspaceHostInner {
             // under the room + presence-seen locks, and the hook takes the
             // doc-host handles lock (the retired escalation's review caught
             // an AB-BA here; never invoke hooks inline under these guards).
-            if let Some(hook) = lock(&self.deaf_escalation).clone()
-                && let Ok(runtime) = tokio::runtime::Handle::try_current()
-            {
-                runtime.spawn(async move { hook() });
+            if let Some(hook) = lock(&self.deaf_escalation).clone() {
+                match tokio::runtime::Handle::try_current() {
+                    Ok(runtime) => {
+                        runtime.spawn(async move { hook() });
+                    }
+                    // Every production caller is a tokio task; if that ever
+                    // changes the sweep must not vanish silently (review k3).
+                    Err(_) => tracing::warn!(
+                        "deaf-escalation sweep skipped: no tokio runtime on this path"
+                    ),
+                }
             }
         }
     }

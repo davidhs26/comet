@@ -391,6 +391,12 @@ pub struct ChatDocHandle {
     /// A threshold checkpoint POST is in flight (review H1: the quiesce
     /// tick must not stack concurrent full-snapshot uploads).
     checkpointing: Arc<AtomicBool>,
+    /// A checkpoint request arrived while one was already in flight (whose
+    /// snapshot may predate the request's content — review k3 finding: a
+    /// turn-end seal silently dropped against a threshold post left the
+    /// final rows uncovered). The in-flight worker re-posts once on
+    /// completion.
+    checkpoint_followup: Arc<AtomicBool>,
     /// Set when a chat2 seed replaced this handle's lineage on disk: every
     /// further snapshot save from this handle is a stale FAT doc that would
     /// clobber the thin one — retired handles never persist again (unless no
@@ -1031,6 +1037,7 @@ impl DocHost {
             room_gen,
             retired: AtomicBool::new(false),
             checkpointing: Arc::new(AtomicBool::new(false)),
+            checkpoint_followup: Arc::new(AtomicBool::new(false)),
             chat2: Mutex::new(None),
             chat2_pending_local: Mutex::new(Vec::new()),
             chat2_local_sub: Mutex::new(None),
@@ -1731,6 +1738,11 @@ impl DocHost {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
+            // The in-flight snapshot may predate THIS request's content —
+            // ask the worker to post once more when it lands (review k3:
+            // a silently dropped turn-end seal left the final rows
+            // uncovered until an unrelated trigger).
+            handle.checkpoint_followup.store(true, Ordering::Release);
             return;
         }
         let in_flight = handle.checkpointing.clone();
@@ -1742,6 +1754,8 @@ impl DocHost {
         let seq_covered = stats.cursor;
         let http = self.inner.http.clone();
         let weak_note = Arc::downgrade(handle);
+        let followup = handle.checkpoint_followup.clone();
+        let host_weak = Arc::downgrade(&self.inner);
         self.spawn_worker(async move {
             let Some(bearer) = edge.bearer().await else {
                 in_flight.store(false, Ordering::Release);
@@ -1782,6 +1796,14 @@ impl DocHost {
                 }
             }
             in_flight.store(false, Ordering::Release);
+            // A request landed while this post was in flight — its content
+            // may postdate our snapshot, so post once more (the CX above is
+            // free again; a second concurrent trigger just re-flags).
+            if followup.swap(false, Ordering::AcqRel)
+                && let (Some(inner), Some(handle)) = (host_weak.upgrade(), weak_note.upgrade())
+            {
+                DocHost { inner }.spawn_chat2_checkpoint(&handle, "followup");
+            }
         });
     }
 
@@ -1799,6 +1821,14 @@ impl DocHost {
     /// Skipped only when the room provably covers everything already
     /// (server state known, a checkpoint at/after the cursor, nothing
     /// pending) — rare right after a real turn.
+    ///
+    /// Deliberate tradeoff (review k3 flagged the per-turn full-doc cost):
+    /// the checkpoint must NOT be skipped when the probe answers — a live
+    /// engine socket says nothing about a reader wedged on a row gap, and
+    /// the wedged reader is the half of the incident class only a fresh
+    /// checkpoint heals. One export+POST per turn is the price of the
+    /// guarantee; tune with a min-interval only if it ever shows up in
+    /// practice.
     pub fn seal_turn(&self, chat_id: &str) {
         let Some(handle) = lock(&self.inner.handles).get(chat_id).cloned() else {
             return;
