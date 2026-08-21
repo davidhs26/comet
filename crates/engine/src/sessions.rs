@@ -26,7 +26,7 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use zeron_doc::{
     DocError, MessagePart, MessageRole, MessageStatus, STREAM_COMMIT_MS, SegmentWriter, SessionDoc,
-    SessionMessageEntry, fold_event_into_parts, sanitize_tool_call,
+    SessionMessageEntry, SubagentStatus, fold_event_into_parts, sanitize_tool_call,
 };
 use zeron_harness::{CancellationToken, Harness, RunControls, SteerMessage};
 use zeron_proto::{
@@ -1460,9 +1460,47 @@ fn fold_inflight(folded: &[MessagePart]) -> bool {
     folded.iter().any(|p| match p {
         MessagePart::Tool {
             id,
-            resolved: false,
+            resolved,
+            subagent_status,
             ..
-        } => id != zeron_proto::LIVE_PLAN_TOOL_ID,
+        } => {
+            if id == zeron_proto::LIVE_PLAN_TOOL_ID {
+                return false;
+            }
+            match subagent_status {
+                // A SPAWN CHIP closes on LIFECYCLE, never on `resolved`
+                // (2026-08-20 incident, chat 9d321b30): the eager-done
+                // policy settles the spawn call under the PARENT tool-use
+                // id while the chip carries the composite `parent:agentId`,
+                // so a finished subagent leaves its chip `resolved: false`
+                // forever. Reading `resolved` here pinned one phantom
+                // in-flight part per subagent, which disarmed BOTH silence
+                // paths — this gate guards the watchdog park AND dispatch's
+                // zombie abort — for the rest of the chat: a turn whose
+                // provider stream died sat Working for 35 minutes with no
+                // park, and a prompt could not abort it either. Tagged
+                // Done/Failed assumes the chip is already in the fold (the
+                // adapter mints the ToolCall before streaming tagged polls).
+                Some(SubagentStatus::Done) | Some(SubagentStatus::Failed) => false,
+                // A live subagent IS work in flight, and legitimately runs
+                // silent for many minutes (an 18.5-minute implement agent
+                // in that same chat). But liveness is tracked by LIFECYCLE
+                // here, not by this arm alone: the chip must ALSO be
+                // unresolved, because the two harnesses close a chip by
+                // different doors — pi: the chip is `parent:agentId`, never
+                // receives a ToolResult, so `resolved: false` forever and
+                // only a tagged Done/Failed closes it; claude foreground:
+                // the chip IS the tool-use id, its own `ToolResult` settles
+                // `resolved: true` while `subagent_status` may never leave
+                // `Running`. Reading `true` here unconditionally pinned the
+                // gate for the rest of the turn after such a ToolResult —
+                // a regression against pre-PR behavior for claude.
+                Some(SubagentStatus::Running) => !*resolved,
+                // Not a spawn chip, or one that has not streamed yet: an
+                // unresolved tool is a command still running.
+                None => !*resolved,
+            }
+        }
         MessagePart::Input {
             resolved: false, ..
         } => true,
